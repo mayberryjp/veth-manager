@@ -1,0 +1,110 @@
+version: 2
+
+project_name: veth-manager
+
+builds:
+  - id: veth-manager
+    main: .
+    binary: veth-manager
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - deploy/veth-manager.service
+      - deploy/ipfix.example.yaml
+      - deploy/ipfix.conf
+      - deploy/firewall.example.yaml
+      - deploy/manual.example.yaml
+      - deploy/sando.example.yaml
+      - deploy/firewall.conf
+      - deploy/veth-manager.logrotate
+
+nfpms:
+  - id: deb
+    package_name: veth-manager
+    file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Arch }}"
+    homepage: https://github.com/mayberryjp/veth-manager
+    maintainer: mayberryjp <mayberryjp@users.noreply.github.com>
+    description: Label-driven naming of Docker host-side bridge veth interfaces.
+    section: admin
+    priority: optional
+    formats:
+      - deb
+    bindir: /usr/sbin
+    conflicts:
+      - veth-renamer
+      - veth-rename
+    dependencies:
+      - iproute2
+      - util-linux
+      - systemd
+      - logrotate
+    contents:
+      - src: deploy/veth-manager.logrotate
+        dst: /etc/logrotate.d/veth-manager
+        type: config
+        file_info:
+          mode: 0644
+      - src: deploy/veth-manager.service
+        dst: /usr/lib/systemd/system/veth-manager.service
+        file_info:
+          mode: 0644
+      - src: README.md
+        dst: /usr/share/doc/veth-manager/README.md
+        file_info:
+          mode: 0644
+      - src: deploy/ipfix.example.yaml
+        dst: /usr/share/doc/veth-manager/ipfix.example.yaml
+        file_info:
+          mode: 0644
+      - src: deploy/ipfix.conf
+        dst: /usr/share/doc/veth-manager/ipfix.conf
+        file_info:
+          mode: 0644
+      - src: deploy/firewall.example.yaml
+        dst: /usr/share/doc/veth-manager/firewall.example.yaml
+        file_info:
+          mode: 0644
+      - src: deploy/manual.example.yaml
+        dst: /usr/share/doc/veth-manager/manual.example.yaml
+        file_info:
+          mode: 0644
+      - src: deploy/sando.example.yaml
+        dst: /usr/share/doc/veth-manager/sando.example.yaml
+        file_info:
+          mode: 0644
+      - src: deploy/firewall.conf
+        dst: /usr/share/doc/veth-manager/firewall.conf
+        file_info:
+          mode: 0644
+    scripts:
+      postinstall: packaging/postinstall.sh
+      preremove: packaging/preremove.sh
+      postremove: packaging/postremove.sh
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+  extra_files:
+    - glob: install.sh
+
+release:
+  github:
+    owner: mayberryjp
+    name: veth-manager
+  extra_files:
+    - glob: install.sh

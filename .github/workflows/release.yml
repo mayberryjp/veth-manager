@@ -1,0 +1,74 @@
+name: Test and release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check eBPF generation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-14 libbpf-dev logrotate
+          go generate ./internal/flow
+      - run: go test -race ./...
+      - run: go vet ./...
+      - name: Test eBPF parser and live veth hooks
+        run: |
+          go test -c -o "$RUNNER_TEMP/flow.test" ./internal/flow
+          sudo unshare --net env FLOW_INTEGRATION=1 "$RUNNER_TEMP/flow.test" -test.run '^TestKernel' -test.v
+      - name: Test controlled interface repair in an isolated network namespace
+        run: |
+          go test -c -o "$RUNNER_TEMP/veth-manager.test" .
+          sudo env PRIMARY_REPAIR_INTEGRATION=1 "$RUNNER_TEMP/veth-manager.test" -test.run '^TestPrimaryRepairKernelIntegration$' -test.v
+      - name: Validate shell scripts
+        run: |
+          for script in install.sh tests/*.sh .github/scripts/*.sh; do bash -n "$script"; done
+          for script in packaging/*.sh; do sh -n "$script"; done
+          shellcheck install.sh tests/*.sh packaging/*.sh .github/scripts/*.sh
+      - run: bash tests/installer_test.sh
+      - run: bash tests/logrotate_test.sh
+      - name: Install verified GoReleaser through the GitHub API
+        run: bash .github/scripts/setup-goreleaser.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: goreleaser check
+      - name: Build snapshot packages
+        run: goreleaser release --snapshot --clean
+      - name: Check Debian packages
+        run: bash tests/package_test.sh
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install verified GoReleaser through the GitHub API
+        run: bash .github/scripts/setup-goreleaser.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: goreleaser release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
