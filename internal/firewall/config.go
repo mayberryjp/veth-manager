@@ -40,6 +40,7 @@ type Rule struct {
 	Protocol        string `yaml:"protocol"`
 	SourcePort      string `yaml:"source_port,omitempty"`
 	DestinationPort string `yaml:"destination_port,omitempty"`
+	Log             *bool  `yaml:"log,omitempty"`
 	// Sando trusts either endpoint orientation and either endpoint's port.
 	SandoMatch bool `yaml:"sando_match,omitempty"`
 }
@@ -104,7 +105,7 @@ func validateNodes(n *yaml.Node) error {
 			if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
 				return fmt.Errorf("mapping keys must be strings")
 			}
-			if (key.Value == "enabled" || key.Value == "audit_mode" || key.Value == "permit_all_icmp" || key.Value == "sando_match" || key.Value == "sando_poll") &&
+			if (key.Value == "enabled" || key.Value == "audit_mode" || key.Value == "permit_all_icmp" || key.Value == "sando_match" || key.Value == "sando_poll" || key.Value == "log") &&
 				(value.Kind != yaml.ScalarNode || value.Tag != "!!bool") {
 				return fmt.Errorf("%s must be a boolean", key.Value)
 			}
@@ -367,6 +368,9 @@ func compileRule(r Rule) (KernelRule, error) {
 	case "deny":
 	default:
 		return k, fmt.Errorf("action must be allow or deny")
+	}
+	if r.Log != nil && !*r.Log {
+		k.Flags |= 32
 	}
 	var sourceFamily, destinationFamily uint8
 	k.Source, k.SourcePrefix, sourceFamily, err = prefix(r.Source)

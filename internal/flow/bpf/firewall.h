@@ -69,6 +69,11 @@ struct {
     __type(value, __u64);
 } drop_losses SEC(".maps");
 
+static __always_inline int deny_verdict(__u8 direction) {
+    // Both hooks still evaluate policy; only selected hooks return TCX_DROP.
+    return audit_mode || !(enforcement_hooks & direction) ? -1 : 2;
+}
+
 static __always_inline int deny(struct flow_key *key, __u8 direction,
                                 __u32 rule, __u8 reason, __u32 octets, __u32 generation) {
     struct drop_event *event = bpf_ringbuf_reserve(&drops, sizeof(*event), 0);
@@ -88,8 +93,7 @@ static __always_inline int deny(struct flow_key *key, __u8 direction,
         if (count)
             *count += 1;
     }
-    // Both hooks still evaluate policy; only selected hooks return TCX_DROP.
-    return audit_mode || !(enforcement_hooks & direction) ? -1 : 2;
+    return deny_verdict(direction);
 }
 
 static __noinline int address_matches(const __u8 *address, const __u8 *network,
@@ -226,7 +230,7 @@ struct rule_context {
     struct flow_key key;
     void *table;
     __u32 matched;
-    __u8 direction, action;
+    __u8 direction, action, flags;
 };
 
 static long find_rule(__u32 index, void *data) {
@@ -237,6 +241,7 @@ static long find_rule(__u32 index, void *data) {
     if (r && rule_matches(r, &context->key, context->direction)) {
         context->matched = r->id;
         context->action = r->action;
+        context->flags = r->flags;
         return 1;
     }
     return 0;
@@ -265,8 +270,11 @@ static __noinline int firewall(struct flow_key *key, __u8 direction,
         return -1;
     bpf_loop(256, find_rule, &context, 0);
     if (context.matched) {
-        if (!context.action)
+        if (!context.action) {
+            if (context.flags & 32)
+                return deny_verdict(direction);
             return deny(key, direction, context.matched, 1, octets, generation);
+        }
         if (remember(key, direction, flags, now, generation))
             return deny(key, direction, context.matched, 4, octets, generation);
         return -1;

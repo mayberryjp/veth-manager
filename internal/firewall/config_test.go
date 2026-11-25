@@ -25,6 +25,40 @@ func fixture(t *testing.T) Config {
 	return c
 }
 
+func TestRuleLoggingOption(t *testing.T) {
+	c := fixture(t)
+	base := "rules:\n  - id: quiet\n    direction: both\n    action: deny\n    source: '*'\n    destination: '*'\n    protocol: udp\n"
+	for _, tc := range []struct {
+		value string
+		quiet bool
+	}{
+		{"", false}, {"true", false}, {"false", true},
+	} {
+		content := base
+		if tc.value != "" {
+			content += "    log: " + tc.value + "\n"
+		}
+		if err := os.WriteFile(c.ManualRules, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		p, err := LoadPolicy(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (p.Kernel[0].Flags&32 != 0) != tc.quiet {
+			t.Fatalf("log=%q: %+v", tc.value, p.Kernel[0])
+		}
+	}
+	for _, value := range []string{`"false"`, "0", "null", "[]"} {
+		if err := os.WriteFile(c.ManualRules, []byte(base+"    log: "+value+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadPolicy(c); err == nil {
+			t.Fatalf("accepted non-boolean log: %s", value)
+		}
+	}
+}
+
 func TestFirewallDefaultsAndDisabledConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "firewall.yaml")
 	for _, content := range []string{"{}", "enabled: false\n", "enabled: true\nmanual_rules: manual.yaml\nsando_rules: sando.yaml\ndrop_log: drops.log\n"} {

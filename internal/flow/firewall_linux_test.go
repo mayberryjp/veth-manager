@@ -44,6 +44,72 @@ func configuredFirewallTestMeter(t *testing.T, rules []firewall.Rule, config fir
 	return m
 }
 
+func TestKernelFirewallQuietDeny(t *testing.T) {
+	quiet, logged := false, true
+	for _, config := range []firewall.Config{
+		{Enabled: true, EnforcementDirection: "both"},
+		{Enabled: true, AuditMode: true},
+		{Enabled: true, EnforcementDirection: "egress"},
+	} {
+		t.Run(fmt.Sprintf("audit=%t-direction=%s", config.AuditMode, config.EnforcementDirection), func(t *testing.T) {
+			rules := []firewall.Rule{
+				{ID: "quiet", Direction: "both", Action: "deny", Source: "*", Destination: "*", Protocol: "udp", DestinationPort: "443", Log: &quiet},
+				{ID: "logged", Direction: "both", Action: "deny", Source: "*", Destination: "*", Protocol: "udp", DestinationPort: "444", Log: &logged},
+			}
+			m := configuredFirewallTestMeter(t, rules, config, 1, 0)
+			for _, hook := range []struct {
+				name      string
+				direction uint8
+			}{{"meter", 1}, {"meter_egress", 2}} {
+				want := ^uint32(0)
+				if config.Enforces(hook.direction) {
+					want = 2
+				}
+				for _, port := range []uint16{443, 444, 445} {
+					packet := ipv4Packet(false, 1234)
+					binary.BigEndian.PutUint16(packet[36:38], port)
+					verdict(t, m, hook.name, packet, want)
+				}
+			}
+			drops, err := m.ReadDrops()
+			if err != nil || len(drops) != 4 {
+				t.Fatalf("quiet deny emitted events: %+v %v", drops, err)
+			}
+			for i, drop := range drops {
+				if i%2 == 0 {
+					if drop.Rule != 2 || drop.Reason != 1 {
+						t.Fatalf("explicit logging changed: %+v", drop)
+					}
+				} else if drop.Rule != 0 || drop.Reason != 0 {
+					t.Fatalf("default denial logging changed: %+v", drop)
+				}
+			}
+			packets, err := m.Read()
+			if err != nil || len(packets) != 6 {
+				t.Fatalf("quiet denial affected IPFIX: %d %v", len(packets), err)
+			}
+			// Changing only logging must take effect on a policy replacement.
+			rules[0].Log = nil
+			compiled, err := firewall.Compile(rules)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.UpdateFirewall(&firewall.Policy{Config: config, Rules: rules, Kernel: compiled, Generation: 2}); err != nil {
+				t.Fatal(err)
+			}
+			want := ^uint32(0)
+			if config.Enforces(1) {
+				want = 2
+			}
+			verdict(t, m, "meter", ipv4Packet(false, 1234), want)
+			drops, err = m.ReadDrops()
+			if err != nil || len(drops) != 1 || drops[0].Rule != 1 || drops[0].Generation != 2 {
+				t.Fatalf("logging reload failed: %+v %v", drops, err)
+			}
+		})
+	}
+}
+
 func TestKernelFirewallAuditVerdictsAndCapture(t *testing.T) {
 	rules := []firewall.Rule{{ID: "deny", Direction: "ingress", Action: "deny", Source: "*", Destination: "*", Protocol: "udp"}}
 	m := configuredFirewallTestMeter(t, rules, firewall.Config{Enabled: true, AuditMode: true}, 4, 0)

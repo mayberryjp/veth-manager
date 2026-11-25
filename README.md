@@ -416,6 +416,25 @@ rules:
 required. Addresses accept literal IPv4/IPv6, CIDRs, or `"*"`. Protocols accept
 `tcp`, `udp`, `icmp`, `icmp6`, `sctp`, a decimal number 0..255, or `"*"`.
 Optional `source_port` / `destination_port` accept decimal 0..65535 or `"*"`;
+optional `log: false` suppresses DROP/WOULD_DROP events for a matched deny rule.
+Omitting `log` or setting `log: true` preserves logging. The value must be a
+YAML boolean. This does not change enforcement, IPFIX capture, default-deny
+logging, or malformed/state-capacity errors, and does not introduce allow
+logging. For example, a manual rule can silently deny UDP port 5353:
+
+```yaml
+rules:
+  - id: quiet-mdns
+    direction: both
+    action: deny
+    source: "*"
+    destination: "*"
+    protocol: udp
+    destination_port: "5353"
+    log: false
+```
+
+For port constraints,
 omission means unconstrained. Zero remains a literal constraint. ICMP uses
 the exporter's zero source port and `(type << 8) | code` destination field,
 not transport ports. Rules must have unique IDs across both files. There is
