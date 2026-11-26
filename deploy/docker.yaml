@@ -1,0 +1,7 @@
+# Connection to the Docker Engine on this host.
+# Alternatively: endpoint: "tcp://127.0.0.1:2375"
+endpoint: "unix:///var/run/docker.sock"
+
+# Empty disables startup management. Use actual Docker container names.
+# start_order: "container1 container2 container3 *"
+start_order: ""

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -59,16 +60,73 @@ type dockerClient struct {
 }
 
 func newDocker(socket string) *dockerClient {
+	return dockerTransport("unix", socket)
+}
+
+func newDockerEndpoint(address string) (*dockerClient, error) {
+	network, target, err := parseDockerEndpoint(address)
+	if err != nil {
+		return nil, err
+	}
+	return dockerTransport(network, target), nil
+}
+
+func parseDockerEndpoint(address string) (string, string, error) {
+	if strings.HasPrefix(address, "/") {
+		return "unix", address, nil
+	}
+	u, err := url.Parse(address)
+	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", "", fmt.Errorf("Docker endpoint must be an absolute Unix socket path, unix:///path, or tcp://host:port")
+	}
+	switch u.Scheme {
+	case "unix":
+		if u.Host == "" && strings.HasPrefix(u.Path, "/") && u.Path != "/" {
+			return "unix", u.Path, nil
+		}
+	case "tcp":
+		host, port, err := net.SplitHostPort(u.Host)
+		number, portErr := strconv.Atoi(port)
+		if err == nil && portErr == nil && host != "" && number >= 1 && number <= 65535 && u.Path == "" {
+			return "tcp", u.Host, nil
+		}
+	}
+	return "", "", fmt.Errorf("invalid Docker endpoint %q; use an absolute Unix socket path, unix:///path, or tcp://host:port", address)
+}
+
+func dockerTransport(network, address string) *dockerClient {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "unix", socket)
+			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, address)
 		},
 		ResponseHeaderTimeout: 10 * time.Second,
 	}
 	return &dockerClient{
-		client: &http.Client{Transport: transport, Timeout: 15 * time.Second},
+		client: &http.Client{Transport: transport, Timeout: 15 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		stream: &http.Client{Transport: transport},
 	}
+}
+
+func (d *dockerClient) start(ctx context.Context, id string) error {
+	path := "/containers/" + url.PathEscape(id) + "/start"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker"+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("Docker start %s: %w", id, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return fmt.Errorf("Docker %s: HTTP %d (reading error: %w)", path, resp.StatusCode, err)
+	}
+	return fmt.Errorf("Docker %s: HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
 func dockerRequest(ctx context.Context, client *http.Client, path string) (*http.Response, error) {

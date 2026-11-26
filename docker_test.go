@@ -179,3 +179,76 @@ func TestNotifyCoalesces(t *testing.T) {
 		t.Fatal("notifications not coalesced")
 	}
 }
+func TestDockerTCPEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/containers/json" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		io.WriteString(w, `[{"Id":"tcp-container"}]`)
+	}))
+	defer server.Close()
+	d, err := newDockerEndpoint(strings.Replace(server.URL, "http://", "tcp://", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.client.CloseIdleConnections()
+	ids, err := d.containers(context.Background())
+	if err != nil || len(ids) != 1 || ids[0] != "tcp-container" {
+		t.Fatalf("TCP endpoint: %v %v", ids, err)
+	}
+}
+
+func TestDockerEndpointValidation(t *testing.T) {
+	for _, tc := range []struct {
+		address, network, target string
+	}{
+		{"/var/run/docker.sock", "unix", "/var/run/docker.sock"},
+		{"unix:///var/run/docker.sock", "unix", "/var/run/docker.sock"},
+		{"tcp://127.0.0.1:2375", "tcp", "127.0.0.1:2375"},
+		{"tcp://[::1]:2375", "tcp", "[::1]:2375"},
+	} {
+		network, target, err := parseDockerEndpoint(tc.address)
+		if err != nil || network != tc.network || target != tc.target {
+			t.Fatalf("%s: %s %s %v", tc.address, network, target, err)
+		}
+	}
+	for _, address := range []string{"", "docker.sock", "unix://host/socket", "unix:///", "tcp://localhost",
+		"tcp://localhost:0", "tcp://localhost:65536", "tcp://localhost:abc", "tcp://localhost:2375/path",
+		"tcp://user@localhost:2375", "tcp://localhost:2375?x=1", "tcp://localhost:2375#fragment",
+		"http://localhost:2375", "https://localhost:2376"} {
+		if _, err := newDockerEndpoint(address); err == nil {
+			t.Errorf("invalid endpoint accepted: %q", address)
+		}
+	}
+}
+
+func TestDockerStartResponses(t *testing.T) {
+	for _, code := range []int{http.StatusNoContent, http.StatusNotModified, http.StatusOK,
+		http.StatusNotFound, http.StatusConflict, http.StatusInternalServerError, http.StatusTemporaryRedirect} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			d := testDockerServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/containers/abc/start" {
+					t.Errorf("unexpected start request: %s %s", r.Method, r.URL.Path)
+				}
+				w.WriteHeader(code)
+				if code != http.StatusNoContent && code != http.StatusNotModified {
+					io.WriteString(w, "start failure")
+				}
+			})
+			err := d.start(context.Background(), "abc")
+			wantError := code != http.StatusNoContent && code != http.StatusNotModified
+			if (err != nil) != wantError {
+				t.Fatalf("HTTP %d: %v", code, err)
+			}
+			if wantError && !strings.Contains(err.Error(), "start failure") {
+				t.Fatalf("error body lost: %v", err)
+			}
+		})
+	}
+	d := newDocker("unused")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := d.start(ctx, "abc"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("start cancellation not propagated: %v", err)
+	}
+}

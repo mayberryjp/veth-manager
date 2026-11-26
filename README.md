@@ -96,6 +96,77 @@ Investigate recurring DHCP teardown/name interactions rather than treating
 cleanup as a fix for their cause. A reboot normally clears nonpersistent stale
 veths but interrupts containers and does not prevent recurrence.
 
+## Docker connection and container startup order
+
+The daemon reads `/etc/veth-manager/docker.yaml` by default. Use
+`--docker-config=/path/to/docker.yaml` to select another file. The package
+installs this administrator-preserved file with startup management disabled:
+
+```yaml
+endpoint: "unix:///var/run/docker.sock"
+start_order: ""
+```
+
+To manage container startup and restart stopped containers automatically:
+
+```yaml
+endpoint: "unix:///var/run/docker.sock"
+start_order: "container1 container2 container3 *"
+```
+
+Entries are exact Docker **container names**, not Compose service names; use
+`docker ps -a --format '{{.Names}}'` to find them. Docker Compose restart
+policies must be set to `restart: "no"` (not `never`) for managed containers.
+Disable other lifecycle automation that could start them independently.
+This tool starts existing containers; it does not create containers or run
+`docker compose up`.
+
+At daemon startup, on Docker events, and every `--interval` (default 30s),
+stopped containers are started serially in the configured order. Each Docker
+start request must succeed before the next request; application health or
+readiness is **not** awaited. Running containers are left alone. If only
+`container2` stops, it is restarted without stopping or restarting the others.
+An intentional `docker stop` will also be undone while management is enabled.
+Stop veth-manager before maintenance.
+
+`*` expands to all other existing containers, sorted by name, at that position
+in the sequence; explicitly named containers are excluded from the wildcard
+even if listed after it. Without `*`, unlisted containers are left alone.
+Missing names and inventory errors abort the scan before any starts; a start
+failure skips later starts in that scan and is logged and retried on subsequent
+scans. Earlier successful starts are not rolled back. This is ordering of
+start requests for stopped containers, not dependency enforcement or a
+guarantee that earlier containers remain running.
+
+An absent default configuration disables startup management and preserves the
+existing socket default. An explicitly selected missing file or invalid file
+fails startup. Configuration is YAML only: unknown/duplicate keys, invalid
+types, aliases, multiple documents, duplicate names and multiple wildcards are
+rejected. Restart the service to reload changes. `--dry-run` logs the sequence
+without starting containers; a nonempty `start_order` cannot be used with
+`--once`, which remains a read-only container lifecycle command.
+
+`endpoint` accepts an absolute Unix socket path, `unix:///path/to/docker.sock`,
+or `tcp://127.0.0.1:2375` (also DNS and bracketed IPv6 with an explicit port).
+An explicitly supplied `--socket` overrides the configured endpoint. The
+connection is shared by startup management, event watching, interface
+reconciliation and cleanup: it must point to the Docker Engine **on this
+Linux host**, not a remote host whose namespaces/interfaces are inaccessible.
+TCP is unencrypted and unauthenticated; do not expose Docker port 2375 to
+untrusted networks. TLS endpoints are not supported.
+
+The base systemd unit permits Unix sockets only. For TCP, add a drop-in using
+`sudo systemctl edit veth-manager.service`:
+
+```ini
+[Service]
+RestrictAddressFamilies=
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+```
+
+Then run `sudo systemctl daemon-reload` and restart the service. Preserve any
+existing IPFIX/firewall drop-ins and custom arguments.
+
 ## Optional eBPF / IPFIX traffic monitoring
 
 IPFIX remains independent of the manager's renaming and cleanup enablement.

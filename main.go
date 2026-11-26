@@ -94,7 +94,8 @@ func monitoredInterfaces(mappings []mapping) []flow.Interface {
 }
 
 func run(log *slog.Logger) (runErr error) {
-	socket := flag.String("socket", "/var/run/docker.sock", "local rootful Docker Unix socket")
+	socket := flag.String("socket", "/var/run/docker.sock", "Docker endpoint override: Unix socket path, unix:///path or tcp://host:port")
+	dockerPath := flag.String("docker-config", defaultDockerConfig, "Docker YAML configuration; container startup sequencing defaults to disabled")
 	mode := flag.String("mode", "primary-repair", "primary-repair (brief host-veth interruption), auto, primary or alternative")
 	vnstat := flag.String("vnstat", "auto", "auto-detect vnStat, off, or path to a vnStat 2.x executable")
 	interval := flag.Duration("interval", 30*time.Second, "full reconciliation interval (at least 1s)")
@@ -118,6 +119,8 @@ func run(log *slog.Logger) (runErr error) {
 	sandoDirectionSet := false
 	analysisOptionsSet := false
 	managerPathSet := false
+	dockerPathSet := false
+	socketSet := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "sando-direction" {
 			sandoDirectionSet = true
@@ -127,6 +130,12 @@ func run(log *slog.Logger) (runErr error) {
 		}
 		if f.Name == "manager-config" {
 			managerPathSet = true
+		}
+		if f.Name == "docker-config" {
+			dockerPathSet = true
+		}
+		if f.Name == "socket" {
+			socketSet = true
 		}
 	})
 	if analysisOptionsSet && !*propose {
@@ -188,6 +197,20 @@ func run(log *slog.Logger) (runErr error) {
 	}
 	if settings.OrphanCleanup.Enabled && *once {
 		return fmt.Errorf("orphan_cleanup requires daemon mode for repeated observation; cannot use once")
+	}
+	dockerSettings, err := loadDockerConfig(*dockerPath, dockerPathSet)
+	if err != nil {
+		return err
+	}
+	if len(dockerSettings.order) > 0 && *once {
+		return fmt.Errorf("start_order requires daemon mode; cannot use once")
+	}
+	if socketSet {
+		dockerSettings.Endpoint = *socket
+	}
+	docker, err := newDockerEndpoint(dockerSettings.Endpoint)
+	if err != nil {
+		return err
 	}
 	var firewallPolicy *firewall.Policy
 	if firewallSettings.Enabled {
@@ -268,7 +291,8 @@ func run(log *slog.Logger) (runErr error) {
 	if settings.Renaming.Enabled && *mode == "primary-repair" && !*dryRun {
 		log.Warn("controlled primary repair enabled; verified managed host veths may be briefly taken DOWN and restored UP")
 	}
-	docker := newDocker(*socket)
+	log.Info("Docker settings", "config", *dockerPath, "endpoint", dockerSettings.Endpoint,
+		"start_order", dockerSettings.order, "dry_run", *dryRun)
 	links := commandLinks{ip: ip, nsenter: nsenter}
 	r := reconciler{docker: docker, links: links, mode: *mode, dryRun: *dryRun, disableRenaming: !settings.Renaming.Enabled}
 	if *vnstat != "off" {
@@ -345,7 +369,15 @@ func run(log *slog.Logger) (runErr error) {
 		cleanup()
 	}
 	var previousError error
+	var previousStartupError error
 	scan := func() {
+		if len(dockerSettings.order) > 0 {
+			err := startContainers(ctx, docker, dockerSettings.order, *dryRun, log)
+			if err != nil && (previousStartupError == nil || err.Error() != previousStartupError.Error()) {
+				log.Error("container startup sequence failed; later starts skipped and daemon will retry", "error", err)
+			}
+			previousStartupError = err
+		}
 		previousError = logScanError(log, reconcile(), previousError)
 	}
 	scan()

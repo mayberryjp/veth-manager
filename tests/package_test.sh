@@ -32,6 +32,11 @@ for package in "${packages[@]}"; do
         <(dpkg-deb --fsys-tarfile "$package" | tar -xOf - ./etc/veth-manager/manager.yaml)
     grep -qx '/etc/veth-manager/manager.yaml' \
         <(dpkg-deb --ctrl-tarfile "$package" | tar -xOf - ./conffiles)
+    grep -qx './etc/veth-manager/docker.yaml' <<< "$files"
+    diff -u deploy/docker.yaml \
+        <(dpkg-deb --fsys-tarfile "$package" | tar -xOf - ./etc/veth-manager/docker.yaml)
+    grep -qx '/etc/veth-manager/docker.yaml' \
+        <(dpkg-deb --ctrl-tarfile "$package" | tar -xOf - ./conffiles)
     for example in ipfix.example.yaml ipfix.conf firewall.example.yaml manual.example.yaml sando.example.yaml firewall.conf; do
         grep -qx "./usr/share/doc/veth-manager/$example" <<< "$files"
         diff -u "deploy/$example" \
