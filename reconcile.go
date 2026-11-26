@@ -33,18 +33,20 @@ type mapping struct {
 }
 
 type snapshot struct {
-	UpdatedAt time.Time `json:"updated_at"`
-	Mode      string    `json:"mode"`
-	DryRun    bool      `json:"dry_run"`
-	Mappings  []mapping `json:"mappings"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	Mode            string    `json:"mode"`
+	DryRun          bool      `json:"dry_run"`
+	Mappings        []mapping `json:"mappings"`
+	RenamingEnabled bool      `json:"renaming_enabled"`
 }
 
 type reconciler struct {
-	docker dockerAPI
-	links  linkAPI
-	mode   string
-	dryRun bool
-	vnstat *vnstatClient
+	docker          dockerAPI
+	links           linkAPI
+	mode            string
+	dryRun          bool
+	vnstat          *vnstatClient
+	disableRenaming bool
 }
 
 type candidate struct {
@@ -101,7 +103,7 @@ func desiredName(c container, networkName string) (string, bool, error) {
 }
 
 func networkKind(n network) string {
-	if strings.HasPrefix(n.Driver, "ghcr.io/claymore666/docker-net-dhcp:") {
+	if isDHCPNetwork(n) {
 		switch n.Options["mode"] {
 		case "", "bridge":
 			return "bridge"
@@ -110,6 +112,10 @@ func networkKind(n network) string {
 		}
 	}
 	return n.Driver
+}
+
+func isDHCPNetwork(n network) bool {
+	return strings.HasPrefix(n.Driver, "ghcr.io/claymore666/docker-net-dhcp:")
 }
 
 func bridgeName(n network) (string, error) {
@@ -135,7 +141,7 @@ func bridgeName(n network) (string, error) {
 }
 
 func (r reconciler) run(ctx context.Context) (snapshot, error) {
-	result := snapshot{UpdatedAt: time.Now().UTC(), Mode: r.mode, DryRun: r.dryRun, Mappings: []mapping{}}
+	result := snapshot{UpdatedAt: time.Now().UTC(), Mode: r.mode, DryRun: r.dryRun, Mappings: []mapping{}, RenamingEnabled: !r.disableRenaming}
 	ids, err := r.docker.containers(ctx)
 	if err != nil {
 		return result, err
@@ -239,7 +245,7 @@ func (r reconciler) run(ctx context.Context) (snapshot, error) {
 	}
 	for _, plan := range candidates {
 		m := &result.Mappings[plan.record]
-		if claims[m.RequestedName] != 1 {
+		if !r.disableRenaming && claims[m.RequestedName] != 1 {
 			fail(plan.record, fmt.Errorf("name %q requested by multiple endpoints; refusing all claimants", m.RequestedName))
 			continue
 		}
@@ -279,6 +285,10 @@ func (r reconciler) apply(ctx context.Context, plan candidate, m *mapping) error
 	}
 	if h.Index != m.IfIndex || h.Name != m.Interface {
 		return fmt.Errorf("%s interface changed during reconciliation; will retry", m.Namespace)
+	}
+	if r.disableRenaming {
+		m.Status = "monitored"
+		return nil
 	}
 	if r.mode == "primary-repair" && plan.pid == 0 {
 		backend, ok := r.links.(repairAPI)

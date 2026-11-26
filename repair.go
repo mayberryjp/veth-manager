@@ -35,20 +35,28 @@ func hostPeer(links []link, target link) (link, bool) {
 	return link{}, false
 }
 
-func staleDHCPName(links []link, target, stale link, endpointMAC string) (string, error) {
+func disconnectedHostVethPeer(links []link, stale link) (link, bool) {
 	peer, found := hostPeer(links, stale)
 	back, reciprocal := hostPeer(links, peer)
-	if !found || !reciprocal || back.Index != stale.Index || stale.Index == target.Index ||
+	if !found || !reciprocal || back.Index != stale.Index ||
+		stale.Index <= 0 || peer.Index <= 0 || stale.Index == peer.Index ||
 		stale.Info.Kind != "veth" || peer.Info.Kind != "veth" ||
-		stale.Master != target.Master || peer.Master != "" ||
+		stale.Master == "" || peer.Master != "" ||
 		len(stale.Flags) == 0 || hasFlag(stale, "LOWER_UP") || hasFlag(stale, "UP") && !hasFlag(stale, "NO-CARRIER") ||
-		len(peer.Flags) == 0 || hasFlag(peer, "UP") ||
+		len(peer.Flags) == 0 || hasFlag(peer, "UP") || hasFlag(peer, "LOWER_UP") {
+		return link{}, false
+	}
+	return peer, true
+}
+
+func staleDHCPName(links []link, target, stale link, endpointMAC string) (string, error) {
+	peer, disconnected := disconnectedHostVethPeer(links, stale)
+	if !disconnected || stale.Index == target.Index || stale.Master != target.Master ||
 		!strings.EqualFold(peer.Address, endpointMAC) {
 		return "", fmt.Errorf("conflicting interface is not a proven disconnected DHCP veth pair")
 	}
-	identity := strings.TrimSuffix(peer.Name, "-dh")
-	decoded, err := hex.DecodeString(identity)
-	if !strings.HasSuffix(peer.Name, "-dh") || err != nil || len(decoded) != 6 {
+	identity, ok := dhcpEndpointIdentity(peer.Name)
+	if !ok {
 		return "", fmt.Errorf("disconnected peer has no recognized DHCP endpoint name")
 	}
 	original := "dh-" + identity
@@ -58,6 +66,12 @@ func staleDHCPName(links []link, target, stale link, endpointMAC string) (string
 		}
 	}
 	return original, nil
+}
+
+func dhcpEndpointIdentity(name string) (string, bool) {
+	identity := strings.TrimSuffix(name, "-dh")
+	decoded, err := hex.DecodeString(identity)
+	return identity, strings.HasSuffix(name, "-dh") && err == nil && len(decoded) == 6
 }
 
 func repairPrimary(ctx context.Context, links repairAPI, target link, desired string, stale *link, staleName, endpointMAC string, validate func(context.Context, link) error) (result link, problem error) {

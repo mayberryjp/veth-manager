@@ -39,6 +39,25 @@ func TestSandoSyncCLIHelper(t *testing.T) {
 	os.Exit(0)
 }
 
+func TestManagerCLIRejectsInvalidConfigurationAndOneShotCleanup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manager.yaml")
+	for _, tc := range []struct {
+		text, want string
+	}{
+		{"renaming:\n  enabled: 'true'\n", "must have type"},
+		{"orphan_cleanup:\n  enabled: true\n", "requires daemon mode"},
+	} {
+		if err := os.WriteFile(path, []byte(tc.text), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=^TestSandoSyncCLIHelper$", "--", "--manager-config="+path, "--once")
+		cmd.Env = append(os.Environ(), "VETH_SANDO_CLI_TEST=1")
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), tc.want) {
+			t.Fatalf("manager CLI validation: %s %v", out, err)
+		}
+	}
+}
+
 func TestSandoSyncDirectionOverrideCLI(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "firewall.yaml")
@@ -50,6 +69,7 @@ func TestSandoSyncDirectionOverrideCLI(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.WriteFile(filepath.Join(dir, "manual.yaml"), []byte("rules: []\n"), 0600); err != nil {
 		t.Fatal(err)
 	}

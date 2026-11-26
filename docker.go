@@ -40,10 +40,11 @@ type container struct {
 }
 
 type network struct {
-	ID      string `json:"Id"`
-	Name    string
-	Driver  string
-	Options map[string]string
+	ID         string `json:"Id"`
+	Name       string
+	Driver     string
+	Options    map[string]string
+	Containers map[string]endpoint
 }
 
 type dockerAPI interface {
@@ -103,15 +104,43 @@ func (d *dockerClient) get(ctx context.Context, path string, out interface{}) er
 }
 
 func (d *dockerClient) containers(ctx context.Context) ([]string, error) {
+	return d.containerIDs(ctx, "/containers/json")
+}
+
+func (d *dockerClient) allContainers(ctx context.Context) ([]string, error) {
+	return d.containerIDs(ctx, "/containers/json?all=1")
+}
+
+func (d *dockerClient) containerIDs(ctx context.Context, path string) ([]string, error) {
 	var list []struct {
 		ID string `json:"Id"`
 	}
-	if err := d.get(ctx, "/containers/json", &list); err != nil {
+	if err := d.get(ctx, path, &list); err != nil {
 		return nil, err
+	}
+	if list == nil {
+		return nil, fmt.Errorf("Docker %s returned a null container list", path)
 	}
 	ids := make([]string, 0, len(list))
 	for _, c := range list {
 		ids = append(ids, c.ID)
+	}
+	return ids, nil
+}
+
+func (d *dockerClient) networkIDs(ctx context.Context) ([]string, error) {
+	var list []struct {
+		ID string `json:"Id"`
+	}
+	if err := d.get(ctx, "/networks", &list); err != nil {
+		return nil, err
+	}
+	if list == nil {
+		return nil, fmt.Errorf("Docker returned a null network list")
+	}
+	ids := make([]string, 0, len(list))
+	for _, n := range list {
+		ids = append(ids, n.ID)
 	}
 	return ids, nil
 }

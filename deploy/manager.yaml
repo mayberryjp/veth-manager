@@ -1,0 +1,8 @@
+# Restart veth-manager after editing. Both mutations require explicit opt-in.
+renaming:
+  enabled: false
+
+orphan_cleanup:
+  enabled: false
+  interval: 5m
+  min_age: 10m

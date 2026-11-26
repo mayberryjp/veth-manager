@@ -8,14 +8,98 @@ replacing an existing installation.
 
 A small Go daemon for **rootful Docker Engine on an Ubuntu
 host**. It reads container labels, finds the matching host-side bridge veth,
-and repairs its actual primary interface name by default. It also names macvlan
-interfaces inside container network namespaces. Unlabeled containers are
+and, when explicitly enabled in `manager.yaml`, repairs its actual primary
+interface name. It also names macvlan interfaces inside container network
+namespaces. Unlabeled containers are
 never renamed. When vnStat 2.x is installed, it also registers verified live
 host interfaces and maintains readable vnStat aliases automatically.
 
+## Manager configuration: opt-in renaming and periodic cleanup
+
+The daemon reads `/etc/veth-manager/manager.yaml` by default; use
+`--manager-config=/path/to/manager.yaml` to select a different file.
+**Renaming and orphan deletion are both disabled unless explicitly enabled.**
+An absent default file keeps both disabled; an explicitly selected missing file,
+unreadable file, or invalid configuration fails startup. YAML only: unknown and
+duplicate keys, wrong types, nulls, aliases, and multiple documents are rejected.
+Restart the service after changing configuration; it is not hot-reloaded.
+
+The Debian package installs this administrator-preserved configuration:
+
+```yaml
+renaming:
+  enabled: false
+
+orphan_cleanup:
+  enabled: false
+  interval: 5m
+  min_age: 10m
+```
+
+Set either `enabled` to `true` independently. `renaming.enabled` gates all
+primary and alternative-name mutations, including primary-repair state changes
+and stale-name reclamation. `--mode` selects the naming strategy but does not
+enable it. Existing interface names are not undone when renaming is disabled.
+Verified labeled endpoints can still be registered with vnStat and monitored
+by the independent IPFIX/firewall configuration without renaming.
+
+**Upgrade action:** to retain automatic renaming, explicitly set
+`renaming.enabled: true` before restarting the new binary. Old `--mode` overrides
+alone no longer enable renaming. Cleanup remains disabled unless opted in.
+
+Automatic cleanup is daemon-only, runs at startup to begin observation, then
+every `orphan_cleanup.interval`, independently of the rename scan interval.
+Both durations must be at least 1s, and `min_age` must be at least `interval`.
+A pair must remain an identical eligible candidate across successful scans for
+at least `min_age`; the first observation never deletes it. A Docker event,
+discovery/deletion failure, interface identity change, or daemon restart resets
+the affected observation history. No age state is persisted across restarts.
+
+Cleanup is deliberately restricted to the existing
+`ghcr.io/claymore666/docker-net-dhcp:*` driver's bridge-mode networks, including
+its default bridge mode. The daemon discovers each host's configured bridges;
+it does not assume `br-vlan20`. It requires:
+
+- A reciprocal host-visible **veth** pair named `dh-<12 hex digits>` and
+  `<12 hex digits>-dh`, with neither peer in another network namespace.
+- A disconnected bridge end on an unambiguously owned DHCP bridge and an
+  administratively DOWN, unbridged peer, with no carrier on either end.
+- No IPv4 or IPv6 addresses on either end.
+- No matching endpoint/container ID prefix in any current Docker network's
+  endpoint records or any container's attachments, including stopped and
+  unlabeled containers.
+
+Ownership and both link identities are reread for **each** deletion, followed
+by a final link/address check immediately before the command. Deleting one end
+removes the pair; both disappearances must be verified. Live links, ambiguous
+or differently named pairs, physical NICs, VLANs, bridges, and ordinary Docker
+bridge networks are never cleanup targets. Every verified deletion is logged
+with both names and ifindexes; failures are explicit and retried after a fresh
+grace period. Renaming and cleanup execute serially in the daemon.
+
+For read-only validation, stop the mutating service and run:
+
+```bash
+sudo veth-manager --manager-config=/etc/veth-manager/manager.yaml --dry-run
+```
+
+This runs periodic observations and logs eligible pairs as `would delete`
+after the grace period, without changing interfaces or vnStat. `--once` cannot
+be combined with enabled orphan cleanup because it cannot establish repeated
+observation. Do not run a second mutating manager concurrently.
+
+This removes stale kernel links, not DHCP leases or plugin-internal records.
+Docker and rtnetlink have no cross-system transaction: checks narrow but cannot
+eliminate races with external lifecycle/network managers. Pause lifecycle
+automation during initial validation and verify real container connectivity.
+Investigate recurring DHCP teardown/name interactions rather than treating
+cleanup as a fix for their cause. A reboot normally clears nonpersistent stale
+veths but interrupts containers and does not prevent recurrence.
+
 ## Optional eBPF / IPFIX traffic monitoring
 
-Renaming and vnStat behavior are unchanged. Enable the independent exporter
+IPFIX remains independent of the manager's renaming and cleanup enablement.
+Enable the independent exporter
 with `--ipfix-config=/etc/veth-manager/ipfix.yaml`. It monitors only verified
 host-side veths belonging to containers managed by the existing rename labels,
 including DHCP bridge veths. Unlabeled containers, macvlan, shared bridges,
@@ -627,7 +711,7 @@ protection must survive daemon failure.
 
 ## Controlled primary-name repair
 
-The default `--mode=primary-repair` gives the verified live host veth the
+With `renaming.enabled: true`, the default `--mode=primary-repair` gives the verified live host veth the
 requested **kernel primary name**, not just an alternative name or vnStat
 alias. For example, traffic for the labeled container flows through
 `veth_youtube`, and `vnstat -i veth_youtube --days` selects that live interface.
@@ -654,6 +738,7 @@ by this repair. New or recreated labeled endpoints are reconciled automatically.
 
 Deploy the matching binary and systemd unit together. The packaged unit uses
 `--mode=primary-repair`; remove old mode overrides if you want the new default.
+Explicitly enable renaming in `manager.yaml`; the mode alone does not opt in.
 The `--dry-run` flag reports planned repairs without changing links or vnStat.
 Successful repair retains the interface index, MAC, and bridge. The daemon
 does not configure addresses or routes.
@@ -661,6 +746,8 @@ vnStat registration and aliases are reconciled using the resulting primary
 name; historical rows are not deleted or merged. DHCP plugins may still leave
 detached pairs during teardown after a primary rename; subsequent scans handle
 proven stale-name collisions using the same rules instead of deleting links.
+The separate opt-in orphan cleanup can remove eligible detached `dh-*` pairs
+after its observation grace period.
 
 ## Non-disruptive naming and monitoring
 
@@ -842,7 +929,8 @@ curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/main/instal
 
 `--start` enables and restarts the service, including on upgrades, so the newly
 installed binary is used. The default naming mode is **primary-repair**, with
-the controlled interruption described above. Set a systemd override if you prefer
+the controlled interruption described above, but renaming must first be enabled
+in `/etc/veth-manager/manager.yaml`. Set a systemd override if you prefer
 alternative names.
 
 For reproducible installs, pin both the script and package to a release:
@@ -908,11 +996,13 @@ window: stopping/restarting clears firewall connection state and starting in
    with both old package names to prevent simultaneous package installations.
 
 4. Copy your configuration and drop-ins to their new locations. The following
-   commands refuse to overwrite pre-existing new directories:
+   commands preserve existing configuration files and refuse to overwrite
+   pre-existing override directories:
 
    ```bash
    if sudo test -d /etc/veth-renamer; then
-       sudo test ! -e /etc/veth-manager && sudo cp -a /etc/veth-renamer /etc/veth-manager
+       sudo install -d -m 0755 /etc/veth-manager
+       sudo cp -an /etc/veth-renamer/. /etc/veth-manager/
    fi
    if sudo test -d /etc/systemd/system/veth-renamer.service.d; then
        sudo test ! -e /etc/systemd/system/veth-manager.service.d &&
@@ -935,6 +1025,8 @@ window: stopping/restarting clears firewall connection state and starting in
 
    Relative `manual_rules: manual.yaml` and `sando_rules: sando.yaml` need no
    changes. Preserve custom options, collectors and Sando endpoints. Update
+   `/etc/veth-manager/manager.yaml` to explicitly enable renaming if desired;
+   the packaged configuration leaves renaming and cleanup disabled.
    `ReadWritePaths` in any Sando-write override to `/etc/veth-manager`.
    Install the new supplied IPFIX/firewall drop-in if you did not have one before.
    Custom drop-log paths also require updating `/etc/logrotate.d/veth-manager`.
@@ -993,14 +1085,16 @@ go vet ./...
 mkdir -p bin
 CGO_ENABLED=0 go build -trimpath -o bin/veth-manager .
 
+# Enable renaming in deploy/manager.yaml before testing naming.
+# Keep orphan_cleanup.enabled false for these one-shot commands.
 # Read-only preview: no interface changes.
-sudo ./bin/veth-manager --once --dry-run
+sudo ./bin/veth-manager --manager-config=deploy/manager.yaml --once --dry-run
 
 # Repair actual primary names, briefly interrupting the affected host veth.
-sudo ./bin/veth-manager --once
+sudo ./bin/veth-manager --manager-config=deploy/manager.yaml --once
 
 # Non-disruptive alternative naming.
-sudo ./bin/veth-manager --once --mode=alternative
+sudo ./bin/veth-manager --manager-config=deploy/manager.yaml --once --mode=alternative
 ```
 
 After changing the packet parser, regenerate the checked-in object on Linux
@@ -1025,6 +1119,11 @@ commands inside the containers.
 
 ```bash
 sudo install -m 0755 bin/veth-manager /usr/sbin/veth-manager
+sudo install -d -m 0755 /etc/veth-manager
+# Initial install only: do not overwrite an existing administrator configuration.
+sudo test -e /etc/veth-manager/manager.yaml ||
+    sudo install -m 0644 deploy/manager.yaml /etc/veth-manager/manager.yaml
+# Edit manager.yaml to enable the desired behaviors before starting.
 sudo install -m 0644 deploy/veth-manager.service /etc/systemd/system/veth-manager.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now veth-manager
@@ -1042,7 +1141,7 @@ Add this override:
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/sbin/veth-manager --mode=alternative --mapping-file=/run/veth-manager/mappings.json
+ExecStart=/usr/sbin/veth-manager --manager-config=/etc/veth-manager/manager.yaml --mode=alternative --mapping-file=/run/veth-manager/mappings.json
 ```
 
 Then run `sudo systemctl daemon-reload && sudo systemctl restart veth-manager`.
@@ -1058,6 +1157,8 @@ Do not enable `PrivateNetwork`: that would hide the host interfaces.
 ## Operation
 
 - Scans running containers at startup and every 30 seconds.
+- Names interfaces only when `renaming.enabled` is true. Optional periodic
+  orphan DHCP cleanup has its own interval and observation grace period.
 - Listens for container/network Docker events, coalesces bursts, and reconciles.
 - Reconnects after event-stream failures; full scans cover missed events,
   startup/attachment races, Docker restarts, and removals.
@@ -1105,7 +1206,8 @@ if a primary rename succeeds.
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--socket` | `/var/run/docker.sock` | Local Docker Unix socket |
-| `--mode` | `primary-repair` | Controlled host-veth interruption and primary-name repair; `auto`/`alternative` avoid downtime; `primary` is strict |
+| `--manager-config` | `/etc/veth-manager/manager.yaml` | YAML opt-ins for renaming and periodic orphan cleanup; both disabled by default |
+| `--mode` | `primary-repair` | Naming strategy when `renaming.enabled` is true; `auto`/`alternative` avoid downtime; `primary` is strict |
 | `--vnstat` | `auto` | Detect vnStat 2.x if installed; `off` disables, or provide an executable path |
 | `--interval` | `30s` | Full scan interval, at least `1s` |
 | `--mapping-file` | disabled | Atomic JSON snapshot; parent directory must exist |
@@ -1115,7 +1217,7 @@ if a primary rename succeeds.
 ### Mapping output
 
 The systemd unit writes `/run/veth-manager/mappings.json`. Each snapshot has
-`updated_at`, `mode`, `dry_run`, and a `mappings` array containing:
+`updated_at`, `mode`, `dry_run`, `renaming_enabled`, and a `mappings` array containing:
 
 - Container ID/name, Docker network ID/name, bridge, IPv4, and IPv6.
 - Current primary `interface`, `ifindex`, and `requested_name`.
@@ -1124,6 +1226,7 @@ The systemd unit writes `/run/veth-manager/mappings.json`. Each snapshot has
   empty `bridge`. The namespace may be absent when discovery fails or a driver
   is unsupported.
 - `status`: `applied`, `unchanged`, `monitored`, `would-change`, `skipped`, or `error`.
+- `monitored` status also indicates a verified endpoint when renaming is disabled.
 - `naming_warning`: auto mode is monitoring a live link instead of applying a name.
 - `vnstat_status`: `applied`, `unchanged`, `would-change`, or `error`, when enabled.
 - `vnstat_error`: registration, alias, database, or readback failures.
@@ -1147,7 +1250,8 @@ They do not prove live kernel/Docker behavior.
 
 Before enabling the service on important workloads:
 
-1. Use a disposable labeled container on a test bridge. Preview with `--once
+1. Set `renaming.enabled: true` and leave cleanup disabled in the selected
+   manager configuration. Use a disposable labeled container on a test bridge. Preview with `--once
    --dry-run`; compare the mapping's MAC/peer/bridge against
    `docker inspect` and `ip -j -d link`.
 2. Maintain a connection or ping to the container while running `--once --mode=primary`.

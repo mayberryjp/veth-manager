@@ -79,6 +79,48 @@ func TestDockerErrors(t *testing.T) {
 	}
 }
 
+func TestCleanupDockerInventoryIncludesStoppedAndNetworkOwners(t *testing.T) {
+	d := testDockerServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/containers/json":
+			if r.URL.Query().Get("all") != "1" {
+				t.Error("cleanup inventory excludes stopped containers")
+			}
+			io.WriteString(w, `[{"Id":"stopped"}]`)
+		case "/networks":
+			io.WriteString(w, `[{"Id":"net1"}]`)
+		case "/networks/net1":
+			io.WriteString(w, `{"Id":"net1","Driver":"ghcr.io/claymore666/docker-net-dhcp:v2.3.1","Options":{"mode":"bridge","bridge":"br-vlan20"},"Containers":{"unknown":{"EndpointID":"abcdef1234567890"}}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	ctx := context.Background()
+	ids, err := d.allContainers(ctx)
+	if err != nil || len(ids) != 1 || ids[0] != "stopped" {
+		t.Fatalf("all containers: %v %v", ids, err)
+	}
+	ids, err = d.networkIDs(ctx)
+	if err != nil || len(ids) != 1 || ids[0] != "net1" {
+		t.Fatalf("networks: %v %v", ids, err)
+	}
+	n, err := d.network(ctx, ids[0])
+	if err != nil || n.Containers["unknown"].EndpointID != "abcdef1234567890" {
+		t.Fatalf("network ownership missing: %+v %v", n, err)
+	}
+}
+
+func TestCleanupRejectsNullDockerInventory(t *testing.T) {
+	d := testDockerServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "null")
+	})
+	if _, err := d.allContainers(context.Background()); err == nil {
+		t.Fatal("null container inventory accepted")
+	}
+	if _, err := d.networkIDs(context.Background()); err == nil {
+		t.Fatal("null network inventory accepted")
+	}
+}
 func TestDockerCancellation(t *testing.T) {
 	d := newDocker("unused")
 	ctx, cancel := context.WithCancel(context.Background())

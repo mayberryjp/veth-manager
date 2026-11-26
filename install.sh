@@ -169,3 +169,4 @@ else
     printf 'To enable/start: sudo systemctl enable --now veth-manager.service\n'
     printf 'If already running, load the new binary: sudo systemctl restart veth-manager.service\n'
 fi
+printf 'Renaming and orphan cleanup require explicit enablement in /etc/veth-manager/manager.yaml.\n'

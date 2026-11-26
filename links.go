@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +61,61 @@ func readLinks(ctx context.Context, program string, args ...string) ([]link, err
 
 func (l commandLinks) host(ctx context.Context) ([]link, error) {
 	return readLinks(ctx, l.ip, "-j", "-d", "link", "show")
+}
+
+func (l commandLinks) addressed(ctx context.Context) (map[int]bool, error) {
+	out, err := command(ctx, l.ip, "-j", "address", "show")
+	if err != nil {
+		return nil, err
+	}
+	var addresses []struct {
+		Index int               `json:"ifindex"`
+		Info  []json.RawMessage `json:"addr_info"`
+	}
+	if err := json.Unmarshal(out, &addresses); err != nil {
+		return nil, fmt.Errorf("decode ip address output: %w", err)
+	}
+	if addresses == nil {
+		return nil, fmt.Errorf("ip address output must be an array")
+	}
+	found := map[int]bool{}
+	for _, address := range addresses {
+		if address.Index <= 0 || address.Info == nil {
+			return nil, fmt.Errorf("ip address output has missing addresses or invalid interface index")
+		}
+		found[address.Index] = len(address.Info) > 0
+	}
+	return found, nil
+}
+
+func (l commandLinks) deletePair(ctx context.Context, expected dhcpPair) error {
+	links, err := l.host(ctx)
+	if err != nil {
+		return err
+	}
+	addressed, err := l.addressed(ctx)
+	if err != nil {
+		return err
+	}
+	pairs := cleanupCandidates(links, addressed,
+		map[string]string{expected.BridgeEnd.Master: expected.NetworkID}, map[string]bool{})
+	if actual, exists := pairs[expected.BridgeEnd.Name]; !exists || !reflect.DeepEqual(actual, expected) {
+		return fmt.Errorf("interface identity changed immediately before deletion")
+	}
+	if _, err := command(ctx, l.ip, "link", "delete", "dev", expected.BridgeEnd.Name); err != nil {
+		return err
+	}
+	after, err := l.host(ctx)
+	if err != nil {
+		return fmt.Errorf("deletion succeeded but verification failed: %w", err)
+	}
+	for _, actual := range after {
+		if actual.Index == expected.BridgeEnd.Index || actual.Index == expected.Peer.Index ||
+			actual.Name == expected.BridgeEnd.Name || actual.Name == expected.Peer.Name {
+			return fmt.Errorf("orphan pair removal was not verified")
+		}
+	}
+	return nil
 }
 
 func (l commandLinks) namespace(ctx context.Context, pid int) ([]link, error) {

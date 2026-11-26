@@ -30,10 +30,11 @@ jobs:
         run: |
           go test -c -o "$RUNNER_TEMP/flow.test" ./internal/flow
           sudo unshare --net env FLOW_INTEGRATION=1 "$RUNNER_TEMP/flow.test" -test.run '^TestKernel' -test.v
-      - name: Test controlled interface repair in an isolated network namespace
+      - name: Test interface repair and orphan cleanup in isolated network namespaces
         run: |
           go test -c -o "$RUNNER_TEMP/veth-manager.test" .
           sudo env PRIMARY_REPAIR_INTEGRATION=1 "$RUNNER_TEMP/veth-manager.test" -test.run '^TestPrimaryRepairKernelIntegration$' -test.v
+          sudo env ORPHAN_CLEANUP_INTEGRATION=1 "$RUNNER_TEMP/veth-manager.test" -test.run '^TestOrphanCleanupKernelIntegration$' -test.v
       - name: Validate shell scripts
         run: |
           for script in install.sh tests/*.sh .github/scripts/*.sh; do bash -n "$script"; done

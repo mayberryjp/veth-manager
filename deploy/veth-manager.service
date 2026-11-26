@@ -1,5 +1,5 @@
 [Unit]
-Description=Label-driven Docker veth and container macvlan naming
+Description=Opt-in Docker interface naming and orphan DHCP veth cleanup
 Documentation=https://docs.docker.com/engine/network/drivers/bridge/
 Wants=docker.service vnstat.service
 After=docker.service vnstat.service
@@ -9,7 +9,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/sbin/veth-manager --mode=primary-repair --mapping-file=/run/veth-manager/mappings.json
+ExecStart=/usr/sbin/veth-manager --manager-config=/etc/veth-manager/manager.yaml --mode=primary-repair --mapping-file=/run/veth-manager/mappings.json
 Restart=on-failure
 RestartSec=5
 RuntimeDirectory=veth-manager

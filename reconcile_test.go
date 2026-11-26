@@ -125,6 +125,27 @@ func fixture() (*fakeDocker, *fakeLinks, reconciler) {
 	return d, l, reconciler{docker: d, links: l, mode: "primary"}
 }
 
+func TestRenamingDisabledStillValidatesAndMonitors(t *testing.T) {
+	d, links, r := fixture()
+	r.disableRenaming = true
+	links.hs = append(links.hs, veth(99, 98, "veth_pihole", "02:00:00:00:00:99", "br-other"))
+	result, err := r.run(context.Background())
+	if err != nil || len(links.calls) != 0 || result.RenamingEnabled ||
+		result.Mappings[0].Status != "monitored" || result.Mappings[0].Interface != "veth_random" {
+		t.Fatalf("disabled renaming mutated links or rejected name collision: %+v %v", result, err)
+	}
+	d.inspectHook = func(_ string, c container) container {
+		ep := c.NetworkSettings.Networks["lan"]
+		ep.MacAddress = "02:00:00:00:00:88"
+		c.NetworkSettings.Networks["lan"] = ep
+		return c
+	}
+	result, err = r.run(context.Background())
+	if err == nil || result.Mappings[0].Status != "error" || len(links.calls) != 0 {
+		t.Fatalf("unverified endpoint monitored: %+v %v", result, err)
+	}
+}
+
 func TestValidName(t *testing.T) {
 	for _, name := range []string{"a", "veth_pihole", "123456789012345", "a.b-c_0"} {
 		if err := validName(name); err != nil {

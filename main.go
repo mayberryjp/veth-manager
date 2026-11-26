@@ -103,6 +103,7 @@ func run(log *slog.Logger) (runErr error) {
 	dryRun := flag.Bool("dry-run", false, "inspect and plan without modifying interfaces")
 	ipfixConfig := flag.String("ipfix-config", "", "opt-in eBPF/IPFIX YAML configuration file (daemon mode only)")
 	firewallConfig := flag.String("firewall-config", "", "firewall YAML configuration (enabled defaults to false)")
+	managerPath := flag.String("manager-config", defaultManagerConfig, "manager YAML configuration; renaming and orphan cleanup default to disabled")
 	sandoSync := flag.Bool("sando-sync", false, "download Sando ignore list, replace generated rules, print YAML, and exit")
 	sandoDump := flag.Bool("sando-dump", false, "print saved Sando rules YAML and exit")
 	sandoDirection := flag.String("sando-direction", "", "override generated rule direction for sando-sync: ingress, egress or both")
@@ -116,12 +117,16 @@ func run(log *slog.Logger) (runErr error) {
 	}
 	sandoDirectionSet := false
 	analysisOptionsSet := false
+	managerPathSet := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "sando-direction" {
 			sandoDirectionSet = true
 		}
 		if f.Name == "firewall-log" || f.Name == "since" || f.Name == "sort" {
 			analysisOptionsSet = true
+		}
+		if f.Name == "manager-config" {
+			managerPathSet = true
 		}
 	})
 	if analysisOptionsSet && !*propose {
@@ -177,6 +182,13 @@ func run(log *slog.Logger) (runErr error) {
 		_, err = os.Stdout.Write(data)
 		return err
 	}
+	settings, err := loadManagerConfig(*managerPath, managerPathSet)
+	if err != nil {
+		return err
+	}
+	if settings.OrphanCleanup.Enabled && *once {
+		return fmt.Errorf("orphan_cleanup requires daemon mode for repeated observation; cannot use once")
+	}
 	var firewallPolicy *firewall.Policy
 	if firewallSettings.Enabled {
 		if *ipfixConfig == "" || *once || *dryRun {
@@ -211,7 +223,7 @@ func run(log *slog.Logger) (runErr error) {
 	if !*dryRun {
 		lock, err := net.Listen("unix", "@veth-manager-interface-owner")
 		if err != nil {
-			return fmt.Errorf("another interface renamer instance may be running: %w", err)
+			return fmt.Errorf("another interface manager instance may be running: %w", err)
 		}
 		defer lock.Close()
 	}
@@ -251,11 +263,14 @@ func run(log *slog.Logger) (runErr error) {
 			"observation_domain_id", monitoringConfig.ObservationDomainID,
 			"sampling_rate", monitoringConfig.SamplingRate, "capture_filter", monitoringConfig.CaptureFilter)
 	}
-	if *mode == "primary-repair" && !*dryRun {
+	log.Info("manager settings", "config", *managerPath, "renaming_enabled", settings.Renaming.Enabled,
+		"orphan_cleanup_enabled", settings.OrphanCleanup.Enabled)
+	if settings.Renaming.Enabled && *mode == "primary-repair" && !*dryRun {
 		log.Warn("controlled primary repair enabled; verified managed host veths may be briefly taken DOWN and restored UP")
 	}
 	docker := newDocker(*socket)
-	r := reconciler{docker: docker, links: commandLinks{ip: ip, nsenter: nsenter}, mode: *mode, dryRun: *dryRun}
+	links := commandLinks{ip: ip, nsenter: nsenter}
+	r := reconciler{docker: docker, links: links, mode: *mode, dryRun: *dryRun, disableRenaming: !settings.Renaming.Enabled}
 	if *vnstat != "off" {
 		program := *vnstat
 		if program == "auto" {
@@ -297,6 +312,38 @@ func run(log *slog.Logger) (runErr error) {
 	}
 	changes := make(chan struct{}, 1)
 	go docker.watch(ctx, changes, log)
+	var cleaner *orphanCleaner
+	var cleanupTicks <-chan time.Time
+	var previousCleanupError error
+	cleanup := func() {
+		result, err := cleaner.run(ctx, time.Now(), func(pair dhcpPair) {
+			log.Info("deleted orphan DHCP veth pair", "interface", pair.BridgeEnd.Name,
+				"peer", pair.Peer.Name, "bridge", pair.BridgeEnd.Master, "network_id", pair.NetworkID,
+				"ifindex", pair.BridgeEnd.Index, "peer_ifindex", pair.Peer.Index)
+		})
+		if err != nil {
+			if previousCleanupError == nil || err.Error() != previousCleanupError.Error() {
+				log.Error("orphan DHCP cleanup failed; observations reset and daemon will retry", "error", err)
+			}
+		} else {
+			for _, pair := range result.Planned {
+				log.Info("would delete orphan DHCP veth pair", "interface", pair.BridgeEnd.Name,
+					"peer", pair.Peer.Name, "bridge", pair.BridgeEnd.Master, "network_id", pair.NetworkID)
+			}
+			log.Info("orphan DHCP cleanup scan", "candidates", result.Candidates,
+				"eligible", result.Eligible, "deleted", len(result.Deleted), "dry_run", *dryRun)
+		}
+		previousCleanupError = err
+	}
+	if settings.OrphanCleanup.Enabled {
+		cleaner = &orphanCleaner{docker: docker, links: links, minAge: settings.OrphanCleanup.minAge, dryRun: *dryRun}
+		cleanupTicker := time.NewTicker(settings.OrphanCleanup.interval)
+		defer cleanupTicker.Stop()
+		cleanupTicks = cleanupTicker.C
+		log.Info("automatic orphan DHCP cleanup enabled", "interval", settings.OrphanCleanup.Interval,
+			"min_age", settings.OrphanCleanup.MinAge)
+		cleanup()
+	}
 	var previousError error
 	scan := func() {
 		previousError = logScanError(log, reconcile(), previousError)
@@ -345,8 +392,17 @@ func run(log *slog.Logger) (runErr error) {
 			}
 			previousFlowError = err
 			continue
+		case <-cleanupTicks:
+			if len(changes) > 0 {
+				cleaner.reset()
+			}
+			cleanup()
+			continue
 		case <-ticker.C:
 		case <-changes:
+			if cleaner != nil {
+				cleaner.reset()
+			}
 			// Coalesce bursts from starts and network attachments.
 			timer := time.NewTimer(300 * time.Millisecond)
 			select {
