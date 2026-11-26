@@ -22,7 +22,7 @@ ProtectSystem=strict
 ReadWritePaths=-/var/lib/vnstat
 ProtectHome=true
 PrivateTmp=true
-# Do not enable PrivateNetwork or restrict namespace entry: nsenter needs host/netns access.
+# Do not enable PrivateNetwork or restrict namespace entry: setns needs host/netns access.
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 

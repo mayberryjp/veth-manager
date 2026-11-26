@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -32,10 +30,7 @@ type linkAPI interface {
 	apply(context.Context, int, string, string, string) error
 }
 
-type commandLinks struct {
-	ip      string
-	nsenter string
-}
+type nativeLinks struct{}
 
 func command(ctx context.Context, program string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -47,48 +42,7 @@ func command(ctx context.Context, program string, args ...string) ([]byte, error
 	return out, nil
 }
 
-func readLinks(ctx context.Context, program string, args ...string) ([]link, error) {
-	out, err := command(ctx, program, args...)
-	if err != nil {
-		return nil, err
-	}
-	var links []link
-	if err := json.Unmarshal(out, &links); err != nil {
-		return nil, fmt.Errorf("decode ip link output: %w", err)
-	}
-	return links, nil
-}
-
-func (l commandLinks) host(ctx context.Context) ([]link, error) {
-	return readLinks(ctx, l.ip, "-j", "-d", "link", "show")
-}
-
-func (l commandLinks) addressed(ctx context.Context) (map[int]bool, error) {
-	out, err := command(ctx, l.ip, "-j", "address", "show")
-	if err != nil {
-		return nil, err
-	}
-	var addresses []struct {
-		Index int               `json:"ifindex"`
-		Info  []json.RawMessage `json:"addr_info"`
-	}
-	if err := json.Unmarshal(out, &addresses); err != nil {
-		return nil, fmt.Errorf("decode ip address output: %w", err)
-	}
-	if addresses == nil {
-		return nil, fmt.Errorf("ip address output must be an array")
-	}
-	found := map[int]bool{}
-	for _, address := range addresses {
-		if address.Index <= 0 || address.Info == nil {
-			return nil, fmt.Errorf("ip address output has missing addresses or invalid interface index")
-		}
-		found[address.Index] = len(address.Info) > 0
-	}
-	return found, nil
-}
-
-func (l commandLinks) deletePair(ctx context.Context, expected dhcpPair) error {
+func (l nativeLinks) deletePair(ctx context.Context, expected dhcpPair) error {
 	links, err := l.host(ctx)
 	if err != nil {
 		return err
@@ -102,7 +56,7 @@ func (l commandLinks) deletePair(ctx context.Context, expected dhcpPair) error {
 	if actual, exists := pairs[expected.BridgeEnd.Name]; !exists || !reflect.DeepEqual(actual, expected) {
 		return fmt.Errorf("interface identity changed immediately before deletion")
 	}
-	if _, err := command(ctx, l.ip, "link", "delete", "dev", expected.BridgeEnd.Name); err != nil {
+	if err := l.mutate(ctx, 0, &expected.BridgeEnd, expected.BridgeEnd.Name, "delete", ""); err != nil {
 		return err
 	}
 	after, err := l.host(ctx)
@@ -118,28 +72,15 @@ func (l commandLinks) deletePair(ctx context.Context, expected dhcpPair) error {
 	return nil
 }
 
-func (l commandLinks) namespace(ctx context.Context, pid int) ([]link, error) {
-	// Query rtnetlink inside the netns; host-mounted sysfs can describe the wrong namespace.
-	return readLinks(ctx, l.nsenter, "-t", strconv.Itoa(pid), "-n", "--", l.ip, "-j", "-d", "link", "show")
-}
-
-func (l commandLinks) nameCommand(pid int, current, desired, mode string) (string, []string) {
-	var args []string
+func (l nativeLinks) apply(ctx context.Context, pid int, current, desired, mode string) error {
+	if err := validName(desired); err != nil {
+		return err
+	}
+	action := "name"
 	if mode == "alternative" {
-		args = []string{"link", "property", "add", "dev", current, "altname", desired}
-	} else {
-		args = []string{"link", "set", "dev", current, "name", desired}
+		action = "add-altname"
 	}
-	if pid > 0 {
-		return l.nsenter, append([]string{"-t", strconv.Itoa(pid), "-n", "--", l.ip}, args...)
-	}
-	return l.ip, args
-}
-
-func (l commandLinks) apply(ctx context.Context, pid int, current, desired, mode string) error {
-	program, args := l.nameCommand(pid, current, desired, mode)
-	_, err := command(ctx, program, args...)
-	return err
+	return l.mutate(ctx, pid, nil, current, action, desired)
 }
 
 func sameLink(current, expected link) bool {
@@ -149,44 +90,20 @@ func sameLink(current, expected link) bool {
 		strings.EqualFold(current.Address, expected.Address)
 }
 
-func (l commandLinks) change(ctx context.Context, expected link, action, value string) error {
-	links, err := l.host(ctx)
-	if err != nil {
-		return err
-	}
-	found := false
-	for _, current := range links {
-		if sameLink(current, expected) {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("interface identity changed before %s %q; refusing mutation", action, value)
-	}
-	var args []string
+func (l nativeLinks) change(ctx context.Context, expected link, action, value string) error {
 	switch action {
 	case "state":
 		if value != "up" && value != "down" {
 			return fmt.Errorf("invalid link state %q", value)
 		}
-		args = []string{"link", "set", "dev", expected.Name, value}
-	case "name":
+	case "name", "del-altname", "add-altname":
 		if err := validName(value); err != nil {
 			return err
 		}
-		args = []string{"link", "set", "dev", expected.Name, "name", value}
-	case "del-altname", "add-altname":
-		verb := "del"
-		if action == "add-altname" {
-			verb = "add"
-		}
-		args = []string{"link", "property", verb, "dev", expected.Name, "altname", value}
 	default:
 		return fmt.Errorf("unsupported repair operation %q", action)
 	}
-	_, err = command(ctx, l.ip, args...)
-	return err
+	return l.mutate(ctx, 0, &expected, expected.Name, action, value)
 }
 
 func ownsName(l link, name string) bool {

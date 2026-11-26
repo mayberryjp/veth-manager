@@ -226,24 +226,3 @@ func TestDHCPUnsupportedModesRemainSkipped(t *testing.T) {
 		})
 	}
 }
-
-func TestNameCommandNamespace(t *testing.T) {
-	l := commandLinks{ip: "/usr/sbin/ip", nsenter: "/usr/bin/nsenter"}
-	for _, pid := range []int{0, 100} {
-		for _, mode := range []string{"primary", "alternative"} {
-			program, args := l.nameCommand(pid, "eth0", "veth_app", mode)
-			wantProgram := l.ip
-			wantArgs := []string{"link", "set", "dev", "eth0", "name", "veth_app"}
-			if mode == "alternative" {
-				wantArgs = []string{"link", "property", "add", "dev", "eth0", "altname", "veth_app"}
-			}
-			if pid > 0 {
-				wantProgram = l.nsenter
-				wantArgs = append([]string{"-t", "100", "-n", "--", l.ip}, wantArgs...)
-			}
-			if program != wantProgram || !reflect.DeepEqual(args, wantArgs) {
-				t.Fatalf("pid=%d mode=%s: got %s %v, want %s %v", pid, mode, program, args, wantProgram, wantArgs)
-			}
-		}
-	}
-}

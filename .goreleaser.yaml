@@ -51,8 +51,6 @@ nfpms:
       - veth-renamer
       - veth-rename
     dependencies:
-      - iproute2
-      - util-linux
       - systemd
       - logrotate
     contents:

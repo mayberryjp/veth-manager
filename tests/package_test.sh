@@ -12,7 +12,7 @@ for package in "${packages[@]}"; do
     [[ "$seen" != *" $arch "* ]]
     seen+="$arch "
     depends=$(dpkg-deb --field "$package" Depends)
-    for dependency in iproute2 util-linux systemd logrotate; do
+    for dependency in systemd logrotate; do
         [[ "$depends" =~ (^|,)[[:space:]]*$dependency([[:space:],]|$) ]]
     done
     conflicts=$(dpkg-deb --field "$package" Conflicts)

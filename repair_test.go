@@ -254,7 +254,7 @@ func TestPrimaryRepairKernelIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend := commandLinks{ip: program}
+	backend := nativeLinks{}
 	for _, args := range [][]string{{"link", "add", "br-test", "type", "bridge"}, {"link", "set", "br-test", "up"}} {
 		if _, err := command(ctx, program, args...); err != nil {
 			t.Fatal(err)

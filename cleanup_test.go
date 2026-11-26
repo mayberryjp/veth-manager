@@ -250,7 +250,7 @@ func TestOrphanCleanupKernelIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend := commandLinks{ip: ip}
+	backend := nativeLinks{}
 	stale, peer := "dh-abcdef123456", "abcdef123456-dh"
 	for _, args := range [][]string{
 		{"link", "add", "br-test", "type", "bridge"},
@@ -310,10 +310,10 @@ func TestOrphanCleanupKernelIntegration(t *testing.T) {
 	if kept[stale] || kept[peer] || !kept["br-test"] || !kept["keep0"] || !kept["keep1"] {
 		t.Fatalf("wrong kernel links removed: %+v", after)
 	}
-	testPeriodicCleanupDaemon(t, ctx, backend, stale, peer)
+	testPeriodicCleanupDaemon(t, ctx, backend, ip, stale, peer)
 }
 
-func testPeriodicCleanupDaemon(t *testing.T, ctx context.Context, backend commandLinks, stale, peer string) {
+func testPeriodicCleanupDaemon(t *testing.T, ctx context.Context, backend nativeLinks, ip, stale, peer string) {
 	t.Helper()
 	for _, args := range [][]string{
 		{"link", "add", stale, "type", "veth", "peer", "name", peer},
@@ -322,7 +322,7 @@ func testPeriodicCleanupDaemon(t *testing.T, ctx context.Context, backend comman
 		{"link", "set", stale, "master", "br-test"},
 		{"link", "set", stale, "up"},
 	} {
-		if _, err := command(ctx, backend.ip, args...); err != nil {
+		if _, err := command(ctx, ip, args...); err != nil {
 			t.Fatal(err)
 		}
 	}

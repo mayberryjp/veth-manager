@@ -254,14 +254,6 @@ func run(log *slog.Logger) (runErr error) {
 		}
 		defer lock.Close()
 	}
-	ip, err := exec.LookPath("ip")
-	if err != nil {
-		return fmt.Errorf("iproute2 is required: %w", err)
-	}
-	nsenter, err := exec.LookPath("nsenter")
-	if err != nil {
-		return fmt.Errorf("util-linux nsenter is required: %w", err)
-	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	var monitoring *flow.Service
@@ -298,7 +290,7 @@ func run(log *slog.Logger) (runErr error) {
 	log.Info("Docker settings", "config", *dockerPath, "endpoint", dockerSettings.Endpoint,
 		"control_container_start_order", dockerSettings.ControlContainerStartOrder,
 		"start_order", dockerSettings.order, "dry_run", *dryRun)
-	links := commandLinks{ip: ip, nsenter: nsenter}
+	links := nativeLinks{}
 	r := reconciler{docker: docker, links: links, mode: *mode, dryRun: *dryRun, disableRenaming: !settings.Renaming.Enabled}
 	if *vnstat != "off" {
 		program := *vnstat

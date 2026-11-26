@@ -35,6 +35,7 @@ jobs:
           go test -c -o "$RUNNER_TEMP/veth-manager.test" .
           sudo env PRIMARY_REPAIR_INTEGRATION=1 "$RUNNER_TEMP/veth-manager.test" -test.run '^TestPrimaryRepairKernelIntegration$' -test.v
           sudo env ORPHAN_CLEANUP_INTEGRATION=1 "$RUNNER_TEMP/veth-manager.test" -test.run '^TestOrphanCleanupKernelIntegration$' -test.v
+          sudo env NATIVE_LINKS_INTEGRATION=1 "$RUNNER_TEMP/veth-manager.test" -test.run '^TestNativeLinksKernelIntegration$' -test.v
       - name: Validate shell scripts
         run: |
           for script in install.sh tests/*.sh .github/scripts/*.sh; do bash -n "$script"; done

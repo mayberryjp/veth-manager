@@ -916,8 +916,8 @@ guarantee of live renaming.
 For readable names without disrupting running containers, use
 `--mode=alternative`. This adds a Linux alternative name while preserving
 Docker's original primary name and interface index. Alternative names require
-kernel/iproute2 support (Linux 5.4+ and suitably recent iproute2); the installed
-`ip` must support `ip link property add ... altname ...`. Ubuntu 22.04/24.04
+kernel support (Linux 5.4+); names are managed directly through rtnetlink.
+Ubuntu 22.04/24.04
 normally have that support. Whether other software accepts alternative names
 depends on the tool/version: test your actual tcpdump, SNMP agent, and monitoring
 stack. An alternative name does **not** change the primary name shown by all
@@ -1191,14 +1191,12 @@ retry the installer. It refuses to silently override a local unit. An old
 
 ## Build and preview
 
-Requires Go 1.23+ to build; Go downloads cilium/ebpf, x/sys and yaml.v3.
+Requires Go 1.23+ to build; Go downloads cilium/ebpf, netlink, netns, x/sys and yaml.v3.
 The precompiled little-endian eBPF object is embedded, so ordinary builds and
 cross-builds require neither clang nor runtime compilation.
 Run these commands on the Ubuntu host:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y iproute2 util-linux
 go test ./...
 go vet ./...
 mkdir -p bin
@@ -1231,8 +1229,14 @@ rm /tmp/veth-flow.test
 
 For cross-compilation, set `GOOS=linux GOARCH=amd64` (or `arm64`) when
 building. The executable runs only on Linux and must be in the host network
-namespace. It calls the host's `ip` and `nsenter`; it does not require these
-commands inside the containers.
+namespace. Interface discovery, address checks, renaming, state changes,
+alternative names, and deletion use native rtnetlink. Container namespace
+access uses `setns` on a dedicated locked OS thread only to create a netlink
+socket; the original namespace is restored before any queries or mutations.
+The daemon requires neither `ip` nor `nsenter` on the host or in containers.
+The optional vnStat and Docker startup sequencing features still invoke
+`vnstat` and `systemctl`, respectively. Kernel integration test fixtures use
+`ip` and `unshare`, so those tests require iproute2 and util-linux.
 
 ## Install as a host service
 
@@ -1400,11 +1404,16 @@ root with `PRIMARY_REPAIR_INTEGRATION=1`. It creates its own disposable network
 namespace and exercises real bridge/veth naming, reclamation, and rollback
 without altering host interfaces.
 
+`TestNativeLinksKernelIntegration`, enabled with `NATIVE_LINKS_INTEGRATION=1`,
+also runs in disposable network namespaces. It verifies native interface and
+address discovery, state changes, alternative names, and container veth/macvlan
+discovery and renaming with an empty `PATH`, including host namespace isolation.
+
 ## Publishing releases
 
 [.goreleaser.yaml](.goreleaser.yaml) builds Linux amd64/arm64 binaries, standalone
 archives, Debian packages, and SHA-256 checksums. The package declares
-`iproute2`, `util-linux`, `systemd`, and `logrotate` dependencies; Docker must already be set
+`systemd` and `logrotate` dependencies; Docker must already be set
 up separately. Package scripts reload systemd but never automatically start,
 enable, or restart the service, including during upgrades.
 
