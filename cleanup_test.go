@@ -161,6 +161,68 @@ func TestOrphanCleanupRejectsUnsafePairs(t *testing.T) {
 	}
 }
 
+func TestOrphanCleanupUnrelatedEventsPreserveGrace(t *testing.T) {
+	_, links, cleaner := cleanupFixture()
+	now := time.Now()
+	if _, err := cleaner.run(context.Background(), now, func(dhcpPair) {}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 6; i++ {
+		if err := cleaner.revalidate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		result, err := cleaner.run(context.Background(), now.Add(time.Duration(i)*10*time.Second), func(dhcpPair) {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < 6 && len(result.Deleted) != 0 {
+			t.Fatal("deleted before the grace period")
+		}
+	}
+	if len(links.deleted) != 1 || len(links.hs) != 0 {
+		t.Fatal("unrelated events prevented orphan deletion")
+	}
+}
+
+func TestOrphanCleanupEventRevalidationResetsAffectedGrace(t *testing.T) {
+	for _, scenario := range []string{"new owner", "identity change", "address added", "discovery failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			d, links, cleaner := cleanupFixture()
+			now := time.Now()
+			if _, err := cleaner.run(context.Background(), now, func(dhcpPair) {}); err != nil {
+				t.Fatal(err)
+			}
+			original := links.hs[0]
+			switch scenario {
+			case "new owner":
+				c := container{ID: "new-owner"}
+				c.NetworkSettings.Networks = map[string]endpoint{"lan": {EndpointID: "abcdef1234567890"}}
+				d.cs[c.ID] = c
+			case "identity change":
+				links.hs[0].Address = "02:00:00:00:00:99"
+			case "address added":
+				links.addresses[50] = true
+			case "discovery failure":
+				d.listErr = errors.New("Docker unavailable")
+			}
+			err := cleaner.revalidate(context.Background())
+			if (err != nil) != (scenario == "discovery failure") || len(cleaner.seen) != 0 {
+				t.Fatalf("event did not invalidate unsafe observation: %v", err)
+			}
+			delete(d.cs, "new-owner")
+			links.hs[0] = original
+			links.addresses[50] = false
+			d.listErr = nil
+			if result, err := cleaner.run(context.Background(), now.Add(time.Minute), func(dhcpPair) {}); err != nil || result.Candidates != 1 || len(links.deleted) != 0 {
+				t.Fatalf("event did not restart the grace period: %+v %v", result, err)
+			}
+			if _, err := cleaner.run(context.Background(), now.Add(2*time.Minute), func(dhcpPair) {}); err != nil || len(links.deleted) != 1 {
+				t.Fatalf("orphan not deleted after fresh grace period: %v", err)
+			}
+		})
+	}
+}
+
 func TestOrphanCleanupChangesAndFailuresResetGrace(t *testing.T) {
 	for _, scenario := range []string{"Docker failure", "address failure", "link failure", "identity change", "disappeared", "delete failure"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -343,7 +405,19 @@ func testPeriodicCleanupDaemon(t *testing.T, ctx context.Context, backend native
 		case "/events":
 			w.WriteHeader(http.StatusOK)
 			w.(http.Flusher).Flush()
-			<-r.Context().Done()
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-ticker.C:
+					if _, err := io.WriteString(w, "{\"Type\":\"container\",\"Action\":\"health_status: healthy\"}\n"); err != nil {
+						return
+					}
+					w.(http.Flusher).Flush()
+				}
+			}
 		default:
 			http.NotFound(w, r)
 		}

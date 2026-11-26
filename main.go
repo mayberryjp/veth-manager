@@ -346,6 +346,14 @@ func run(log *slog.Logger) (runErr error) {
 	var cleaner *orphanCleaner
 	var cleanupTicks <-chan time.Time
 	var previousCleanupError error
+	revalidateCleanup := func() {
+		if err := cleaner.revalidate(ctx); err != nil {
+			if previousCleanupError == nil || err.Error() != previousCleanupError.Error() {
+				log.Error("orphan DHCP cleanup failed; observations reset and daemon will retry", "error", err)
+			}
+			previousCleanupError = err
+		}
+	}
 	cleanup := func() {
 		result, err := cleaner.run(ctx, time.Now(), func(pair dhcpPair) {
 			log.Info("deleted orphan DHCP veth pair", "interface", pair.BridgeEnd.Name,
@@ -433,14 +441,14 @@ func run(log *slog.Logger) (runErr error) {
 			continue
 		case <-cleanupTicks:
 			if len(changes) > 0 {
-				cleaner.reset()
+				revalidateCleanup()
 			}
 			cleanup()
 			continue
 		case <-ticker.C:
 		case <-changes:
 			if cleaner != nil {
-				cleaner.reset()
+				revalidateCleanup()
 			}
 			// Coalesce bursts from starts and network attachments.
 			timer := time.NewTimer(300 * time.Millisecond)

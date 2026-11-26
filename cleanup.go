@@ -162,6 +162,20 @@ func (c *orphanCleaner) candidates(ctx context.Context) (map[string]dhcpPair, er
 	return cleanupCandidates(links, addressed, bridges, protected), nil
 }
 
+func (c *orphanCleaner) revalidate(ctx context.Context) error {
+	pairs, err := c.candidates(ctx)
+	if err != nil {
+		c.reset()
+		return err
+	}
+	for name, observation := range c.seen {
+		if pair, exists := pairs[name]; !exists || !reflect.DeepEqual(pair, observation.pair) {
+			delete(c.seen, name)
+		}
+	}
+	return nil
+}
+
 func (c *orphanCleaner) run(ctx context.Context, now time.Time, deleted func(dhcpPair)) (result cleanupResult, problem error) {
 	defer func() {
 		if problem != nil {

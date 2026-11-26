@@ -1,18 +1,216 @@
 # veth-manager
 
-Successor to [mayberryjp/veth-rename](https://github.com/mayberryjp/veth-rename).
-The binary, Debian package, systemd service and default configuration/log paths
-now use `veth-manager`. Docker label names and network behavior are unchanged.
-See [migration instructions](#migrating-from-veth-rename--veth-renamer) before
-replacing an existing installation.
+**Readable Docker network interfaces, with optional traffic monitoring and control.**
 
-A small Go daemon for **rootful Docker Engine on an Ubuntu
-host**. It reads container labels, finds the matching host-side bridge veth,
-and, when explicitly enabled in `manager.yaml`, repairs its actual primary
-interface name. It also names macvlan interfaces inside container network
-namespaces. Unlabeled containers are
-never renamed. When vnStat 2.x is installed, it also registers verified live
-host interfaces and maintains readable vnStat aliases automatically.
+veth-manager gives labeled Docker containers recognizable network interface
+names, making troubleshooting and traffic reporting easier. Instead of working
+with a name like `veth8a3c1f2`, you can identify an interface as `veth_app`.
+It runs as a small background service on your Ubuntu Docker host and keeps
+names and monitoring registrations up to date as containers are recreated.
+
+## Features
+
+| Feature | What it helps you do |
+| --- | --- |
+| Readable interface names | Identify containers by name when inspecting network traffic. Supports Docker bridge networks and container-side macvlan naming. |
+| Automatic vnStat integration | Register verified live host interfaces and maintain readable reporting aliases when vnStat 2.x is installed. |
+| Optional IPFIX monitoring | Export container flow records to your collector using eBPF, without requiring interface renaming. |
+| Optional firewall | Apply per-container traffic policies, preview would-be drops in audit mode, and optionally import Sando allow rules. |
+| Optional startup ordering | Start existing containers in a chosen sequence once per Docker service startup. This orders start requests, not application readiness. |
+| Targeted DHCP-link cleanup | Remove verified orphaned veth pairs left by supported docker-net-dhcp bridge networks after an observation period. |
+
+**You choose what to enable.** Renaming, orphan cleanup, startup ordering,
+traffic export and firewalling are opt-in. Unlabeled containers are never
+renamed. The default naming strategy, when enabled, repairs the actual primary
+interface name and **briefly interrupts the affected container's networking**.
+Choose [alternative naming or auto mode](#non-disruptive-naming-and-monitoring)
+if that interruption is unacceptable.
+
+## Requirements
+
+- An **Ubuntu host running local, rootful Docker Engine**.
+- `amd64` or `arm64` for the Debian release packages.
+- `curl`, `sudo` (unless running as root), and standard Ubuntu package tools,
+  including systemd. No Go installation is needed for a release package.
+- Optional: vnStat 2.x for traffic history and reporting aliases.
+- Optional: Linux 6.6+ with TCX/eBPF support for
+  [IPFIX monitoring](#optional-ebpf--ipfix-traffic-monitoring) and firewalling.
+
+This is not for Docker Desktop, rootless Docker, remote Docker hosts,
+Kubernetes or Swarm overlay networks. See
+[supported networks](#macvlan-and-docker-net-dhcp-networks) for details.
+
+Upgrading from [mayberryjp/veth-rename](https://github.com/mayberryjp/veth-rename)?
+Follow the [migration instructions](#migrating-from-veth-rename--veth-renamer)
+instead of the fresh-install quick start. The old released package and service
+were named `veth-renamer`; do not run both services together.
+
+## Quick start
+
+This example is for a **fresh installation** on an Ubuntu Docker host. It
+enables readable primary names only; cleanup, startup ordering, IPFIX and the
+firewall remain disabled.
+
+### 1. Install
+
+Run on the Docker host:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/main/install.sh | bash
+```
+
+The installer downloads the latest stable Debian release, checks its SHA-256
+checksum and installs it. **It does not start or enable the service.** A
+published release is required; see [installation options](#installation-options)
+for prerequisites, version pinning and download troubleshooting.
+
+This command executes a downloaded script. Download and inspect it first if
+you prefer to review the code before running it.
+
+### 2. Label a container
+
+Add `host-veth-name` to a service in your Docker Compose file. For example:
+
+```yaml
+services:
+  app:
+    image: nginx:alpine
+    labels:
+      host-veth-name: veth_app
+```
+
+Apply the change from the directory containing that Compose file:
+
+```bash
+docker compose up -d app
+```
+
+Changing labels on an existing container requires recreating it, which can
+interrupt its service. Choose a name unique across the host, no more than
+15 characters long. See [labels](#labels) for multiple-network examples.
+
+### 3. Enable renaming
+
+Edit the installed configuration:
+
+```bash
+sudoedit /etc/veth-manager/manager.yaml
+```
+
+Set `renaming.enabled` to `true` and leave cleanup disabled:
+
+```yaml
+renaming:
+  enabled: true
+
+orphan_cleanup:
+  enabled: false
+  interval: 5m
+  min_age: 10m
+```
+
+**Primary-name repair briefly interrupts networking when it changes a name.**
+For a no-interruption naming strategy, configure
+[alternative mode](#install-as-a-host-service) before starting the service.
+
+### 4. Preview without changing anything
+
+```bash
+sudo veth-manager --manager-config=/etc/veth-manager/manager.yaml --once --dry-run
+```
+
+Check that the JSON output identifies the expected container and requested
+name, with no errors. The preview does not rename interfaces or update vnStat;
+it is not a substitute for testing connectivity on a disposable workload.
+
+### 5. Start and check the service
+
+```bash
+sudo systemctl enable --now veth-manager.service
+sudo systemctl is-active veth-manager.service
+sudo journalctl -u veth-manager.service --since "5 minutes ago" --no-pager -o cat
+ip link show dev veth_app
+```
+
+Expect `active` from systemd and the requested interface name from `ip`.
+Check the logs for errors and verify that the container still has the
+connectivity your application needs. A running service alone does not prove
+that naming succeeded. The service also writes its latest container/interface
+mapping to `/run/veth-manager/mappings.json`.
+
+## Guide and reference
+
+- [Installation options](#installation-options)
+- [Manager configuration and cleanup](#manager-configuration-opt-in-renaming-and-periodic-cleanup)
+- [Docker connection and startup ordering](#docker-connection-and-container-startup-order)
+- [IPFIX traffic monitoring](#optional-ebpf--ipfix-traffic-monitoring)
+- [Firewall and Sando integration](#optional-ebpf-firewall-and-sando-ignore-list-import)
+- [Primary-name repair](#controlled-primary-name-repair) and [non-disruptive naming](#non-disruptive-naming-and-monitoring)
+- [Choosing a naming mode](#choosing-a-naming-mode)
+- [Supported networks](#macvlan-and-docker-net-dhcp-networks) and [container labels](#labels)
+- [Migration](#migrating-from-veth-rename--veth-renamer), [upgrades and removal](#upgrade-and-uninstall)
+- [Building from source](#build-and-preview) and [manual service installation](#install-as-a-host-service)
+- [Operation](#operation), [flags](#flags) and [mapping output](#mapping-output)
+- [Host validation](#validation-on-your-ubuntu-host) and [publishing releases](#publishing-releases)
+
+## Installation options
+
+The [quick-start installer](#1-install) detects the Debian architecture
+(`amd64` or `arm64`), resolves the latest stable GitHub release, downloads its
+`.deb` and `checksums.txt`, verifies the SHA-256 digest and package identity,
+and installs it through `apt-get`. It uses `sudo` only for package installation
+and optional service control.
+
+If `curl` is missing, install it first:
+
+```bash
+sudo apt-get update
+sudo apt-get install curl
+```
+
+If package dependencies cannot be found, run `sudo apt-get update` before
+retrying the installer.
+
+If a release download fails (for example, with a GitHub gateway timeout), the
+installer retries that same release asset through GitHub's API. This fallback
+requires `python3` to validate release metadata; install it with
+`sudo apt-get install python3` if needed. SHA-256 verification and package
+identity checks remain mandatory, and installation stops if either download
+route or verification fails.
+
+### Start during installation
+
+Installation does not start, enable, or restart the daemon by default. If
+configuration is already ready, you can explicitly enable and restart it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/main/install.sh | bash -s -- --start
+```
+
+`--start` enables and restarts the service, including on upgrades, so the newly
+installed binary is used. It does **not** enable renaming or other opt-in
+features. Renaming must first be enabled in
+`/etc/veth-manager/manager.yaml`; the default naming mode is primary-repair.
+Preserve or configure a systemd override if you prefer alternative names.
+
+### Pin a version
+
+For reproducible installs, pin both the script and package to a release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/v0.1.1/install.sh | bash -s -- --version v0.1.1
+```
+
+These URLs require the source and a release to be published; the `v0.1.1` example
+is not a claim that such a release already exists. Replace it with your chosen
+published tag. The `main` branch URL tracks the newest installer, while the
+default package version is the newest stable release. Explicit `--version`
+also supports prerelease tags. Forks can use `--repo OWNER/REPO` with an
+installer downloaded from their own repository.
+
+Checksums detect corrupt or mismatched assets. Because the package and
+checksums come from the same GitHub release, they do not protect against a
+compromised repository or publisher.
 
 ## Manager configuration: opt-in renaming and periodic cleanup
 
@@ -51,9 +249,12 @@ Automatic cleanup is daemon-only, runs at startup to begin observation, then
 every `orphan_cleanup.interval`, independently of the rename scan interval.
 Both durations must be at least 1s, and `min_age` must be at least `interval`.
 A pair must remain an identical eligible candidate across successful scans for
-at least `min_age`; the first observation never deletes it. A Docker event,
-discovery/deletion failure, interface identity change, or daemon restart resets
-the affected observation history. No age state is persisted across restarts.
+at least `min_age`; the first observation never deletes it. Docker events
+trigger fresh ownership, link and address checks: unchanged eligible pairs
+keep their observation history, while changed or newly owned pairs lose it.
+Unrelated container events do not restart every pair's grace period.
+Discovery/deletion failures and daemon restarts reset all observations.
+No age state is persisted across restarts.
 
 Cleanup is deliberately restricted to the existing
 `ghcr.io/claymore666/docker-net-dhcp:*` driver's bridge-mode networks, including
@@ -904,7 +1105,7 @@ The unit permits writes to `/var/lib/vnstat` and includes `CAP_DAC_OVERRIDE`
 to update a database owned by the vnstat account. Sites using a custom
 database directory must add that directory to the unit's `ReadWritePaths`.
 
-## Important correction to the original proposal
+## Choosing a naming mode
 
 **Do not assume an active veth can be renamed.** Linux normally rejects primary
 interface renames while a device is UP (`Device or resource busy`). Strict
@@ -1015,61 +1216,7 @@ their ownership:
 sudo ip link property del dev veth_original altname veth_old
 ```
 
-## One-line installation (Ubuntu)
-
-Once a release is published in
-[mayberryjp/veth-manager](https://github.com/mayberryjp/veth-manager):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/main/install.sh | bash
-```
-
-The installer detects the Debian architecture (`amd64` or `arm64`), resolves the
-latest stable GitHub release, downloads its `.deb` and `checksums.txt`, verifies
-the SHA-256 digest and package identity, and installs it through `apt-get`.
-It uses `sudo` only for package installation and optional service control.
-Requires `curl`, `sudo` (unless already root), and standard Ubuntu package tools.
-If needed, run `sudo apt-get update` before installing so dependency indexes are
-current. No Go toolchain is needed on the target host.
-
-If a release download fails (for example, with a GitHub gateway timeout), the
-installer retries that same release asset through GitHub's API. This fallback
-requires `python3` to validate release metadata; install it with
-`sudo apt-get install python3` if needed. SHA-256 verification and package
-identity checks remain mandatory, and installation stops if either download
-route or verification fails.
-
-**Installation does not start, enable, or restart the daemon by default.**
-To explicitly enable and start it:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/main/install.sh | bash -s -- --start
-```
-
-`--start` enables and restarts the service, including on upgrades, so the newly
-installed binary is used. The default naming mode is **primary-repair**, with
-the controlled interruption described above, but renaming must first be enabled
-in `/etc/veth-manager/manager.yaml`. Set a systemd override if you prefer
-alternative names.
-
-For reproducible installs, pin both the script and package to a release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/v0.1.1/install.sh | bash -s -- --version v0.1.1
-```
-
-These URLs require the source and a release to be published; the `v0.1.1` example
-is not a claim that such a release already exists. The `main` branch URL tracks
-the newest installer, while the default package version is the newest stable
-release. Explicit `--version` also supports prerelease tags. Forks can use
-`--repo OWNER/REPO` with an installer downloaded from their own repository.
-
-Piping a script into Bash executes downloaded code. For greater control,
-download and inspect it before running. Checksums detect corrupt or mismatched
-assets; because the package and checksums come from the same GitHub release,
-they do not protect against a compromised repository or publisher.
-
-### Migrating from veth-rename / veth-renamer
+## Migrating from veth-rename / veth-renamer
 
 The old repository was named `veth-rename`, but its released Debian package,
 binary and service were named **`veth-renamer`**. The new package is
@@ -1274,8 +1421,9 @@ Then run `sudo systemctl daemon-reload && sudo systemctl restart veth-manager`.
 The unit deliberately runs on the host as root, with bounded capabilities for
 namespace entry and link management. It does not use a privileged container,
 mount the Docker socket into a container, or enable a TCP Docker API. Access to
-the Docker socket is **root-equivalent**, even though this implementation only
-issues GET requests. Systemd hardening does not make the Docker socket safe for
+the Docker socket is **root-equivalent**. Interface discovery uses read-only
+Docker requests; optional startup sequencing also sends container start
+requests. Systemd hardening does not make the Docker socket safe for
 untrusted code. Review the binary and labels as privileged configuration.
 Do not enable `PrivateNetwork`: that would hide the host interfaces.
 
@@ -1287,8 +1435,9 @@ Do not enable `PrivateNetwork`: that would hide the host interfaces.
 - Listens for container/network Docker events, coalesces bursts, and reconciles.
 - Reconnects after event-stream failures; full scans cover missed events,
   startup/attachment races, Docker restarts, and removals.
-- For bridge networks, matches each Docker endpoint's MAC address against `ip -j -d link` **inside
-  the container network namespace**, then checks reciprocal peer indices,
+- For bridge networks, matches each Docker endpoint's MAC address against
+  interfaces discovered through native rtnetlink **inside the container network
+  namespace**, then checks reciprocal peer indices,
   host veth type, and expected bridge membership. No `eth0` assumption or host
   sysfs lookup inside just a network namespace.
 - Supports the default bridge, custom Compose bridges, and explicit bridge
