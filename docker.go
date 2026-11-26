@@ -29,8 +29,11 @@ type container struct {
 		Labels map[string]string
 	}
 	State struct {
-		Running bool
-		Pid     int
+		Running    bool
+		Restarting bool
+		Dead       bool
+		Status     string
+		Pid        int
 	}
 	HostConfig struct {
 		NetworkMode string

@@ -22,6 +22,10 @@ import (
 )
 
 func writeSnapshot(path string, result snapshot) error {
+	return writeJSONAtomic(path, result, 0644)
+}
+
+func writeJSONAtomic(path string, result interface{}, mode os.FileMode) error {
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return err
@@ -33,7 +37,7 @@ func writeSnapshot(path string, result snapshot) error {
 	}
 	name := f.Name()
 	defer os.Remove(name)
-	if err := f.Chmod(0644); err != nil {
+	if err := f.Chmod(mode); err != nil {
 		f.Close()
 		return err
 	}
@@ -101,7 +105,7 @@ func run(log *slog.Logger) (runErr error) {
 	interval := flag.Duration("interval", 30*time.Second, "full reconciliation interval (at least 1s)")
 	mappingFile := flag.String("mapping-file", "", "atomic JSON snapshot path; parent directory must exist")
 	once := flag.Bool("once", false, "reconcile once, print JSON, then exit (nonzero on errors)")
-	dryRun := flag.Bool("dry-run", false, "inspect and plan without modifying interfaces")
+	dryRun := flag.Bool("dry-run", false, "inspect and plan without modifying interfaces or containers")
 	ipfixConfig := flag.String("ipfix-config", "", "opt-in eBPF/IPFIX YAML configuration file (daemon mode only)")
 	firewallConfig := flag.String("firewall-config", "", "firewall YAML configuration (enabled defaults to false)")
 	managerPath := flag.String("manager-config", defaultManagerConfig, "manager YAML configuration; renaming and orphan cleanup default to disabled")
@@ -336,6 +340,16 @@ func run(log *slog.Logger) (runErr error) {
 		return reconcile()
 	}
 	changes := make(chan struct{}, 1)
+	starter := containerStarter{statePath: defaultDockerStartupState}
+	if dockerSettings.ControlContainerStartOrder {
+		systemctl, err := exec.LookPath("systemctl")
+		if err != nil {
+			return fmt.Errorf("startup sequencing requires systemctl and the local docker.service: %w", err)
+		}
+		starter.invocation = func(ctx context.Context) (string, error) {
+			return dockerServiceInvocation(ctx, systemctl)
+		}
+	}
 	go docker.watch(ctx, changes, log)
 	var cleaner *orphanCleaner
 	var cleanupTicks <-chan time.Time
@@ -373,7 +387,7 @@ func run(log *slog.Logger) (runErr error) {
 	var previousStartupError error
 	scan := func() {
 		if dockerSettings.ControlContainerStartOrder {
-			err := startContainers(ctx, docker, dockerSettings, *dryRun, log)
+			err := starter.run(ctx, docker, dockerSettings, *dryRun, log)
 			if err != nil && (previousStartupError == nil || err.Error() != previousStartupError.Error()) {
 				log.Error("container startup sequence failed; later starts skipped and daemon will retry", "error", err)
 			}

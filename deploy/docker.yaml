@@ -2,7 +2,7 @@
 # Alternatively: endpoint: "tcp://127.0.0.1:2375"
 endpoint: "unix:///var/run/docker.sock"
 
-# Explicitly enable container startup/restart management.
+# Run startup sequencing once per local Docker service invocation.
 control_container_start_order: false
 
 # Use actual Docker container names; this order is retained when control is disabled.

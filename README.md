@@ -108,7 +108,7 @@ control_container_start_order: false
 start_order: ""
 ```
 
-To manage container startup and restart stopped containers automatically:
+To sequence container startup once per Docker daemon startup:
 
 ```yaml
 endpoint: "unix:///var/run/docker.sock"
@@ -117,10 +117,12 @@ start_order: "container1 container2 container3 *"
 ```
 
 `control_container_start_order` defaults to `false` and gates only container
-startup/restart management, not Docker access for interface reconciliation or
+startup sequencing, not Docker access for interface reconciliation or
 cleanup. Set it to `false` to disable management while preserving `start_order`;
 an omitted flag also disables management even when an order is configured.
 An empty order starts nothing regardless of the flag.
+An enabled empty sequence is also recorded as complete; adding names later
+affects the next Docker invocation, not the current one.
 
 **Upgrade from v0.1.2:** a nonempty `start_order` alone no longer enables
 management. Explicitly set `control_container_start_order: true` to retain it.
@@ -132,20 +134,53 @@ Disable other lifecycle automation that could start them independently.
 This tool starts existing containers; it does not create containers or run
 `docker compose up`.
 
-At daemon startup, on Docker events, and every `--interval` (default 30s),
-stopped containers are started serially in the configured order. Each Docker
-start request must succeed before the next request; application health or
-readiness is **not** awaited. Running containers are left alone. If only
-`container2` stops, it is restarted without stopping or restarting the others.
-An intentional `docker stop` will also be undone while management is enabled.
-Stop veth-manager before maintenance.
+Startup sequencing requires the local, systemd-managed `docker.service`.
+The daemon reads its `ActiveState` and `InvocationID` with `systemctl`.
+The invocation ID changes when systemd starts or restarts Docker, but not when
+veth-manager restarts or a Docker event stream reconnects. Docker must be active
+and its API must successfully return the container inventory before planning
+any starts. Events and the periodic `--interval` scan (default 30s) recheck the
+service identity; an event-stream disconnect alone is not a restart signal.
+
+For each previously unprocessed invocation, the controller captures the
+configured sequence of existing container IDs. Stopped containers are started
+serially; running containers are marked processed without restarting them.
+Each start request must succeed before proceeding; application health or
+readiness is **not** awaited. A failed start is logged and retried on later scans,
+but successfully processed containers are not started again during those retries.
+A captured container that is removed or renamed is logged and skipped rather
+than replaced by a newly created container with the same name.
+
+Progress and the completed invocation ID are atomically saved in
+`/var/lib/veth-manager/docker-startup.json`. Once complete, there are **no further
+container starts for that Docker invocation**, even if a container crashes,
+Compose replaces it, the order changes, or veth-manager restarts. Renaming,
+cleanup and monitoring continue normally. Only a new Docker service invocation
+allows another startup sequence. `--dry-run` reads existing state and logs
+pending starts without writing state or starting containers.
+
+**Change from v0.1.3:** this is startup-only sequencing, not continuous crash
+recovery. Image upgrades and intentional stops after the startup sequence are
+left to Compose or your updater; slow image downloads need no special pause.
+On the first enabled run, if no state file exists, the current active Docker
+invocation is treated as unprocessed and runs one initial sequence. Retain the
+state file across manager restarts and package upgrades. The packaged service
+creates its persistent directory with `StateDirectory=veth-manager`; manual
+installs must permit writes there. Missing initial state is normal; unreadable
+or invalid existing state and failed writes prevent further startup mutations.
+
+Docker and the filesystem do not share a transaction: a process crash between
+a confirmed start and its progress write can leave an unrecorded start.
+Already-running containers are skipped on recovery, but absolute exactly-once
+start-request delivery across that crash window cannot be guaranteed.
 
 `*` expands to all other existing containers, sorted by name, at that position
 in the sequence; explicitly named containers are excluded from the wildcard
 even if listed after it. Without `*`, unlisted containers are left alone.
 Missing names and inventory errors abort the scan before any starts; a start
 failure skips later starts in that scan and is logged and retried on subsequent
-scans. Earlier successful starts are not rolled back. This is ordering of
+scans of the pending startup sequence. Earlier successful starts are not rolled
+back. This is ordering of
 start requests for stopped containers, not dependency enforcement or a
 guarantee that earlier containers remain running.
 
@@ -1207,7 +1242,9 @@ sudo install -d -m 0755 /etc/veth-manager
 # Initial install only: do not overwrite an existing administrator configuration.
 sudo test -e /etc/veth-manager/manager.yaml ||
     sudo install -m 0644 deploy/manager.yaml /etc/veth-manager/manager.yaml
-# Edit manager.yaml to enable the desired behaviors before starting.
+sudo test -e /etc/veth-manager/docker.yaml ||
+    sudo install -m 0644 deploy/docker.yaml /etc/veth-manager/docker.yaml
+# Edit manager.yaml and docker.yaml to enable the desired behaviors before starting.
 sudo install -m 0644 deploy/veth-manager.service /etc/systemd/system/veth-manager.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now veth-manager

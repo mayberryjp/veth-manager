@@ -77,7 +77,9 @@ func TestStartContainersOrderAndRestart(t *testing.T) {
 			var output bytes.Buffer
 			log := slog.New(slog.NewJSONHandler(&output, nil))
 			settings := dockerConfig{ControlContainerStartOrder: true, order: tc.order}
-			err := startContainers(context.Background(), d, settings, tc.dryRun, log)
+			invocation := strings.Repeat("a", 32)
+			starter := testContainerStarter(t, &invocation)
+			err := starter.run(context.Background(), d, settings, tc.dryRun, log)
 			if (err != nil) != tc.wantError || !reflect.DeepEqual(starts, tc.want) {
 				t.Fatalf("starts=%v want=%v err=%v", starts, tc.want, err)
 			}
@@ -103,13 +105,17 @@ func TestStartContainersOrderAndRestart(t *testing.T) {
 			}
 			if tc.name == "ordered wildcard" {
 				starts = nil
-				if err := startContainers(context.Background(), d, settings, false, log); err != nil || len(starts) != 0 {
+				if err := starter.run(context.Background(), d, settings, false, log); err != nil || len(starts) != 0 {
 					t.Fatalf("running containers restarted: %v %v", starts, err)
 				}
 				running["beta"] = false
-				if err := startContainers(context.Background(), d, settings, false, log); err != nil ||
+				if err := starter.run(context.Background(), d, settings, false, log); err != nil || len(starts) != 0 {
+					t.Fatalf("completed startup restarted a stopped container: %v %v", starts, err)
+				}
+				invocation = strings.Repeat("b", 32)
+				if err := starter.run(context.Background(), d, settings, false, log); err != nil ||
 					!reflect.DeepEqual(starts, []string{"beta"}) {
-					t.Fatalf("stopped container not restarted alone: %v %v", starts, err)
+					t.Fatalf("new Docker invocation did not start stopped container: %v %v", starts, err)
 				}
 			}
 		})
@@ -157,9 +163,11 @@ func TestStartupInspectionFailuresPreventStarts(t *testing.T) {
 				c.State.Running = inspections > 1 && mode == "already started"
 				json.NewEncoder(w).Encode(c)
 			})
-			err := startContainers(context.Background(), d, dockerConfig{ControlContainerStartOrder: true, order: []string{"alpha"}}, false,
+			invocation := strings.Repeat("a", 32)
+			starter := testContainerStarter(t, &invocation)
+			err := starter.run(context.Background(), d, dockerConfig{ControlContainerStartOrder: true, order: []string{"alpha"}}, false,
 				slog.New(slog.NewTextHandler(io.Discard, nil)))
-			if (err != nil) != (mode != "already started") {
+			if (err != nil) != (mode != "already started" && mode != "identity changed") {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
@@ -177,8 +185,9 @@ func TestStartupControlDisabledPreservesDockerAccess(t *testing.T) {
 	})
 	settings := dockerConfig{order: []string{"missing-container", "*"}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var starter containerStarter
 	for _, dryRun := range []bool{false, true} {
-		if err := startContainers(context.Background(), d, settings, dryRun, log); err != nil {
+		if err := starter.run(context.Background(), d, settings, dryRun, log); err != nil {
 			t.Fatal(err)
 		}
 	}
