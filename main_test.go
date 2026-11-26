@@ -70,7 +70,8 @@ func TestDockerCLIRejectsInvalidConfigurationAndOneShotStartup(t *testing.T) {
 	}{
 		{"start_order: [a, b]\n", "must be a string"},
 		{"start_order: a b '*'\n", "invalid container name"},
-		{"start_order: 'a b *'\n", "requires daemon mode"},
+		{"control_container_start_order: true\nstart_order: 'a b *'\n", "requires daemon mode"},
+		{"control_container_start_order: 'true'\n", "must be a boolean"},
 		{"endpoint: tcp://localhost\n", "invalid Docker endpoint"},
 	} {
 		if err := os.WriteFile(path, []byte(tc.text), 0600); err != nil {

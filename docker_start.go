@@ -14,10 +14,11 @@ type dockerStartupAPI interface {
 	start(context.Context, string) error
 }
 
-func startContainers(ctx context.Context, docker dockerStartupAPI, order []string, dryRun bool, log *slog.Logger) error {
-	if len(order) == 0 {
+func startContainers(ctx context.Context, docker dockerStartupAPI, settings dockerConfig, dryRun bool, log *slog.Logger) error {
+	if !settings.ControlContainerStartOrder || len(settings.order) == 0 {
 		return nil
 	}
+	order := settings.order
 	ids, err := docker.allContainers(ctx)
 	if err != nil {
 		return fmt.Errorf("startup inventory: %w", err)

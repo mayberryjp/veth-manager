@@ -13,7 +13,14 @@ func TestDockerConfigOrderAndValidation(t *testing.T) {
 		invalid    bool
 	}{
 		{"disabled", "start_order: ''\n", false},
-		{"ordered", "endpoint: tcp://127.0.0.1:2375\nstart_order: container1 container2 container3 *\n", false},
+		{"ordered", "control_container_start_order: true\nendpoint: tcp://127.0.0.1:2375\nstart_order: container1 container2 container3 *\n", false},
+		{"disabled with order", "control_container_start_order: false\nstart_order: 'a b *'\n", false},
+		{"omitted with order", "start_order: 'a b *'\n", false},
+		{"quoted control", "control_container_start_order: 'true'\n", true},
+		{"null control", "control_container_start_order: null\n", true},
+		{"numeric control", "control_container_start_order: 1\n", true},
+		{"duplicate control", "control_container_start_order: true\ncontrol_container_start_order: false\n", true},
+		{"alias control", "control_container_start_order: &control true\nstart_order: *control\n", true},
 		{"wildcard first", "start_order: '* container1'\n", false},
 		{"unknown", "socket: /var/run/docker.sock\n", true},
 		{"duplicate key", "start_order: a\nstart_order: b\n", true},
@@ -39,12 +46,19 @@ func TestDockerConfigOrderAndValidation(t *testing.T) {
 			if (err != nil) != tc.invalid {
 				t.Fatalf("config=%+v err=%v", c, err)
 			}
+			if !tc.invalid && c.ControlContainerStartOrder != (tc.name == "ordered") {
+				t.Fatalf("unexpected startup control state: %+v", c)
+			}
 			if tc.name == "ordered" && (c.Endpoint != "tcp://127.0.0.1:2375" ||
 				!reflect.DeepEqual(c.order, []string{"container1", "container2", "container3", "*"})) {
 				t.Fatalf("order or endpoint lost: %+v", c)
 			}
 			if tc.name == "disabled" && len(c.order) != 0 {
 				t.Fatal("empty order enabled startup")
+			}
+			if (tc.name == "disabled with order" || tc.name == "omitted with order") &&
+				!reflect.DeepEqual(c.order, []string{"a", "b", "*"}) {
+				t.Fatalf("disabled control lost saved order: %+v", c)
 			}
 		})
 	}
@@ -53,7 +67,7 @@ func TestDockerConfigOrderAndValidation(t *testing.T) {
 func TestDockerMissingConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "docker.yaml")
 	c, err := loadDockerConfig(path, false)
-	if err != nil || len(c.order) != 0 || c.Endpoint != "/var/run/docker.sock" {
+	if err != nil || c.ControlContainerStartOrder || len(c.order) != 0 || c.Endpoint != "/var/run/docker.sock" {
 		t.Fatalf("missing default: %+v %v", c, err)
 	}
 	if _, err := loadDockerConfig(path, true); err == nil {

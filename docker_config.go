@@ -17,9 +17,10 @@ import (
 const defaultDockerConfig = "/etc/veth-manager/docker.yaml"
 
 type dockerConfig struct {
-	Endpoint   string `yaml:"endpoint"`
-	StartOrder string `yaml:"start_order"`
-	order      []string
+	ControlContainerStartOrder bool   `yaml:"control_container_start_order"`
+	Endpoint                   string `yaml:"endpoint"`
+	StartOrder                 string `yaml:"start_order"`
+	order                      []string
 }
 
 var dockerContainerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
@@ -55,11 +56,15 @@ func loadDockerConfig(path string, explicit bool) (dockerConfig, error) {
 	for i := 0; i < len(root.Content); i += 2 {
 		key, value := root.Content[i], root.Content[i+1]
 		if key.Kind != yaml.ScalarNode || key.Tag != "!!str" ||
-			(key.Value != "endpoint" && key.Value != "start_order") {
+			(key.Value != "endpoint" && key.Value != "start_order" && key.Value != "control_container_start_order") {
 			return c, fmt.Errorf("unknown Docker configuration field %q", key.Value)
 		}
-		if value.Kind != yaml.ScalarNode || value.Tag != "!!str" {
-			return c, fmt.Errorf("Docker %s must be a string", key.Value)
+		tag, kind := "!!str", "string"
+		if key.Value == "control_container_start_order" {
+			tag, kind = "!!bool", "boolean"
+		}
+		if value.Kind != yaml.ScalarNode || value.Tag != tag {
+			return c, fmt.Errorf("Docker %s must be a %s", key.Value, kind)
 		}
 	}
 	if err := root.Decode(&c); err != nil {

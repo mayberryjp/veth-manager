@@ -76,7 +76,8 @@ func TestStartContainersOrderAndRestart(t *testing.T) {
 			})
 			var output bytes.Buffer
 			log := slog.New(slog.NewJSONHandler(&output, nil))
-			err := startContainers(context.Background(), d, tc.order, tc.dryRun, log)
+			settings := dockerConfig{ControlContainerStartOrder: true, order: tc.order}
+			err := startContainers(context.Background(), d, settings, tc.dryRun, log)
 			if (err != nil) != tc.wantError || !reflect.DeepEqual(starts, tc.want) {
 				t.Fatalf("starts=%v want=%v err=%v", starts, tc.want, err)
 			}
@@ -102,11 +103,11 @@ func TestStartContainersOrderAndRestart(t *testing.T) {
 			}
 			if tc.name == "ordered wildcard" {
 				starts = nil
-				if err := startContainers(context.Background(), d, tc.order, false, log); err != nil || len(starts) != 0 {
+				if err := startContainers(context.Background(), d, settings, false, log); err != nil || len(starts) != 0 {
 					t.Fatalf("running containers restarted: %v %v", starts, err)
 				}
 				running["beta"] = false
-				if err := startContainers(context.Background(), d, tc.order, false, log); err != nil ||
+				if err := startContainers(context.Background(), d, settings, false, log); err != nil ||
 					!reflect.DeepEqual(starts, []string{"beta"}) {
 					t.Fatalf("stopped container not restarted alone: %v %v", starts, err)
 				}
@@ -156,11 +157,36 @@ func TestStartupInspectionFailuresPreventStarts(t *testing.T) {
 				c.State.Running = inspections > 1 && mode == "already started"
 				json.NewEncoder(w).Encode(c)
 			})
-			err := startContainers(context.Background(), d, []string{"alpha"}, false,
+			err := startContainers(context.Background(), d, dockerConfig{ControlContainerStartOrder: true, order: []string{"alpha"}}, false,
 				slog.New(slog.NewTextHandler(io.Discard, nil)))
 			if (err != nil) != (mode != "already started") {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestStartupControlDisabledPreservesDockerAccess(t *testing.T) {
+	requests := 0
+	d := testDockerServer(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.RequestURI() != "/containers/json" {
+			t.Errorf("disabled startup issued request: %s %s", r.Method, r.URL.RequestURI())
+		}
+		io.WriteString(w, `[{"Id":"running-container"}]`)
+	})
+	settings := dockerConfig{order: []string{"missing-container", "*"}}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, dryRun := range []bool{false, true} {
+		if err := startContainers(context.Background(), d, settings, dryRun, log); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if requests != 0 {
+		t.Fatal("disabled control contacted Docker for startup management")
+	}
+	ids, err := d.containers(context.Background())
+	if err != nil || len(ids) != 1 || ids[0] != "running-container" {
+		t.Fatalf("disabled startup prevented normal Docker access: %v %v", ids, err)
 	}
 }

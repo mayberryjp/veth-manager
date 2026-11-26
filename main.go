@@ -202,8 +202,8 @@ func run(log *slog.Logger) (runErr error) {
 	if err != nil {
 		return err
 	}
-	if len(dockerSettings.order) > 0 && *once {
-		return fmt.Errorf("start_order requires daemon mode; cannot use once")
+	if dockerSettings.ControlContainerStartOrder && *once {
+		return fmt.Errorf("control_container_start_order requires daemon mode; cannot use once")
 	}
 	if socketSet {
 		dockerSettings.Endpoint = *socket
@@ -292,6 +292,7 @@ func run(log *slog.Logger) (runErr error) {
 		log.Warn("controlled primary repair enabled; verified managed host veths may be briefly taken DOWN and restored UP")
 	}
 	log.Info("Docker settings", "config", *dockerPath, "endpoint", dockerSettings.Endpoint,
+		"control_container_start_order", dockerSettings.ControlContainerStartOrder,
 		"start_order", dockerSettings.order, "dry_run", *dryRun)
 	links := commandLinks{ip: ip, nsenter: nsenter}
 	r := reconciler{docker: docker, links: links, mode: *mode, dryRun: *dryRun, disableRenaming: !settings.Renaming.Enabled}
@@ -371,8 +372,8 @@ func run(log *slog.Logger) (runErr error) {
 	var previousError error
 	var previousStartupError error
 	scan := func() {
-		if len(dockerSettings.order) > 0 {
-			err := startContainers(ctx, docker, dockerSettings.order, *dryRun, log)
+		if dockerSettings.ControlContainerStartOrder {
+			err := startContainers(ctx, docker, dockerSettings, *dryRun, log)
 			if err != nil && (previousStartupError == nil || err.Error() != previousStartupError.Error()) {
 				log.Error("container startup sequence failed; later starts skipped and daemon will retry", "error", err)
 			}

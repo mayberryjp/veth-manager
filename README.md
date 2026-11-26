@@ -104,6 +104,7 @@ installs this administrator-preserved file with startup management disabled:
 
 ```yaml
 endpoint: "unix:///var/run/docker.sock"
+control_container_start_order: false
 start_order: ""
 ```
 
@@ -111,8 +112,18 @@ To manage container startup and restart stopped containers automatically:
 
 ```yaml
 endpoint: "unix:///var/run/docker.sock"
+control_container_start_order: true
 start_order: "container1 container2 container3 *"
 ```
+
+`control_container_start_order` defaults to `false` and gates only container
+startup/restart management, not Docker access for interface reconciliation or
+cleanup. Set it to `false` to disable management while preserving `start_order`;
+an omitted flag also disables management even when an order is configured.
+An empty order starts nothing regardless of the flag.
+
+**Upgrade from v0.1.2:** a nonempty `start_order` alone no longer enables
+management. Explicitly set `control_container_start_order: true` to retain it.
 
 Entries are exact Docker **container names**, not Compose service names; use
 `docker ps -a --format '{{.Names}}'` to find them. Docker Compose restart
@@ -143,8 +154,10 @@ existing socket default. An explicitly selected missing file or invalid file
 fails startup. Configuration is YAML only: unknown/duplicate keys, invalid
 types, aliases, multiple documents, duplicate names and multiple wildcards are
 rejected. Restart the service to reload changes. `--dry-run` logs the sequence
-without starting containers; a nonempty `start_order` cannot be used with
-`--once`, which remains a read-only container lifecycle command.
+without starting containers when control is enabled.
+`control_container_start_order: true` cannot be used with `--once`, which
+remains a read-only container lifecycle command. A saved order with control
+disabled does not prevent `--once`.
 
 `endpoint` accepts an absolute Unix socket path, `unix:///path/to/docker.sock`,
 or `tcp://127.0.0.1:2375` (also DNS and bracketed IPv6 with an explicit port).

@@ -2,6 +2,9 @@
 # Alternatively: endpoint: "tcp://127.0.0.1:2375"
 endpoint: "unix:///var/run/docker.sock"
 
-# Empty disables startup management. Use actual Docker container names.
+# Explicitly enable container startup/restart management.
+control_container_start_order: false
+
+# Use actual Docker container names; this order is retained when control is disabled.
 # start_order: "container1 container2 container3 *"
 start_order: ""
