@@ -138,7 +138,7 @@ func TestKernelFirewallAuditVerdictsAndCapture(t *testing.T) {
 		switch i {
 		case 8:
 			reason = 0
-		case 9, 11:
+		case 11:
 			reason = 3
 		case 10:
 			reason = 2
@@ -413,6 +413,276 @@ func TestKernelFirewallICMPAndFragments(t *testing.T) {
 	fragment := ipv4Packet(false, 1234)
 	fragment[20] = 0x20
 	verdict(t, m, "meter", fragment, 2)
+	fragment[23] = 1
+	verdict(t, m, "meter", fragment, ^uint32(0))
+	fragment[20], fragment[21] = 0, 1
+	verdict(t, m, "meter", fragment, ^uint32(0))
+	verdict(t, disabled, "meter", fragment, 2)
+}
+
+type kernelFragmentKey struct {
+	Source, Destination                  [16]byte
+	ID                                   uint32
+	Protocol, Family, Direction, Padding uint8
+}
+
+type kernelFragmentValue struct {
+	Lock, Generation            uint32
+	First                       uint64
+	SourcePort, DestinationPort uint16
+	Protocol, Retiring          uint8
+	Padding                     [2]byte
+}
+
+func fragmentPackets(family uint8, id uint32) (first, later []byte) {
+	first = ipv4Packet(false, 1234)
+	if family == 6 {
+		first = ipv6Packet(false)
+		first[20] = 44
+		binary.BigEndian.PutUint16(first[56:58], 1)
+		binary.BigEndian.PutUint32(first[58:62], id)
+		binary.BigEndian.PutUint16(first[66:68], 16)
+	} else {
+		binary.BigEndian.PutUint16(first[18:20], uint16(id))
+		binary.BigEndian.PutUint16(first[20:22], 0x2000)
+		binary.BigEndian.PutUint16(first[38:40], 16)
+	}
+	later = append([]byte(nil), first...)
+	if family == 6 {
+		binary.BigEndian.PutUint16(later[56:58], 8)
+		clear(later[62:])
+	} else {
+		binary.BigEndian.PutUint16(later[20:22], 1)
+		clear(later[34:])
+	}
+	return first, later
+}
+
+func TestKernelFirewallFragmentTracking(t *testing.T) {
+	for _, family := range []uint8{4, 6} {
+		t.Run(fmt.Sprint(family), func(t *testing.T) {
+			rules := []firewall.Rule{
+				{ID: "deny", Direction: "both", Action: "deny", Source: "*", Destination: "*", Protocol: "udp", DestinationPort: "444"},
+				{ID: "allow", Direction: "ingress", Action: "allow", Source: "*", Destination: "*", Protocol: "udp", DestinationPort: "443"},
+			}
+			// Neither sampling nor a TCP-only capture filter may bypass fragment policy.
+			m := firewallTestMeter(t, rules, true, 4, 3)
+			first, later := fragmentPackets(family, 123)
+			verdict(t, m, "meter", later, 2)
+			verdict(t, m, "meter", first, ^uint32(0))
+			verdict(t, m, "meter", later, ^uint32(0))
+			verdict(t, m, "meter_egress", later, 2)
+			for _, change := range []string{"id", "source", "destination", "protocol"} {
+				other := append([]byte(nil), later...)
+				switch change {
+				case "id":
+					if family == 6 {
+						other[61]++
+					} else {
+						other[19]++
+					}
+				case "source":
+					if family == 6 {
+						other[37]++
+					} else {
+						other[29]++
+					}
+				case "destination":
+					if family == 6 {
+						other[53]++
+					} else {
+						other[33]++
+					}
+				case "protocol":
+					if family == 6 {
+						other[54] = 6
+					} else {
+						other[23] = 6
+					}
+				}
+				verdict(t, m, "meter", other, 2)
+			}
+			// A denied new datagram reusing an ID invalidates its old authorization.
+			portOffset := 34
+			if family == 6 {
+				portOffset = 62
+			}
+			binary.BigEndian.PutUint16(first[portOffset:portOffset+2], 5678)
+			binary.BigEndian.PutUint16(first[portOffset+2:portOffset+4], 444)
+			verdict(t, m, "meter", first, 2)
+			verdict(t, m, "meter", later, 2)
+			drops, err := m.ReadDrops()
+			if err != nil || len(drops) != 8 {
+				t.Fatalf("fragment drops: %+v %v", drops, err)
+			}
+			for i, drop := range drops {
+				want := uint8(3)
+				if i == 6 {
+					want = 1
+					if drop.DestinationPort != 444 || drop.Rule != 1 {
+						t.Fatalf("first fragment did not match its port rule: %+v", drop)
+					}
+				}
+				if drop.Reason != want {
+					t.Fatalf("fragment drop %d: %+v", i, drop)
+				}
+			}
+			packets, err := m.Read()
+			if err != nil || len(packets) != 0 {
+				t.Fatalf("fragments leaked into IPFIX: %d %v", len(packets), err)
+			}
+		})
+	}
+}
+
+func TestKernelFirewallFragmentExpiryAndReload(t *testing.T) {
+	for _, family := range []uint8{4, 6} {
+		t.Run(fmt.Sprint(family), func(t *testing.T) {
+			rules := []firewall.Rule{{ID: "udp", Direction: "ingress", Action: "allow", Source: "*", Destination: "*", Protocol: "udp", DestinationPort: "443"}}
+			m := firewallTestMeter(t, rules, true, 1, 0)
+			first, later := fragmentPackets(family, 123)
+			verdict(t, m, "meter", first, ^uint32(0))
+			key := kernelFragmentKey{ID: 123, Family: family, Protocol: 17, Direction: 1}
+			if family == 6 {
+				copy(key.Source[:], first[22:38])
+				copy(key.Destination[:], first[38:54])
+			} else {
+				copy(key.Source[:], first[26:30])
+				copy(key.Destination[:], first[30:34])
+			}
+			var saved kernelFragmentValue
+			if err := m.collection.Maps["fragments"].Lookup(key, &saved); err != nil {
+				t.Fatal(err)
+			}
+			verdict(t, m, "meter", later, ^uint32(0))
+			var refreshed kernelFragmentValue
+			if err := m.collection.Maps["fragments"].Lookup(key, &refreshed); err != nil {
+				t.Fatal(err)
+			}
+			if saved.First != refreshed.First {
+				t.Fatal("later fragments extended authorization lifetime")
+			}
+			now, err := monotonic()
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved.First = now - uint64(31*time.Second)
+			if err := m.collection.Maps["fragments"].Update(key, saved, ebpf.UpdateAny); err != nil {
+				t.Fatal(err)
+			}
+			verdict(t, m, "meter", later, 2)
+			verdict(t, m, "expire_states", make([]byte, 14), 0)
+			if err := m.collection.Maps["fragments"].Lookup(key, &saved); !errors.Is(err, ebpf.ErrKeyNotExist) {
+				t.Fatalf("expired fragment was not reclaimed: %v", err)
+			}
+			verdict(t, m, "meter", first, ^uint32(0))
+			if err := m.UpdateFirewall(&firewall.Policy{Generation: 2}); err != nil {
+				t.Fatal(err)
+			}
+			verdict(t, m, "meter", later, 2)
+			verdict(t, m, "meter", first, 2)
+			drops, err := m.ReadDrops()
+			if err != nil || len(drops) != 3 || drops[0].Reason != 3 ||
+				drops[1].Reason != 3 || drops[1].Generation != 2 || drops[2].Reason != 0 {
+				t.Fatalf("fragment expiry/reload: %+v %v", drops, err)
+			}
+		})
+	}
+}
+
+func TestKernelFirewallFragmentAuditAndCapacity(t *testing.T) {
+	for _, audit := range []bool{false, true} {
+		t.Run(fmt.Sprint(audit), func(t *testing.T) {
+			requireKernel(t)
+			rules := []firewall.Rule{{ID: "udp", Direction: "ingress", Action: "allow", Source: "*", Destination: "*", Protocol: "udp", DestinationPort: "443"}}
+			compiled, err := firewall.Compile(rules)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := loadConfiguredMeter(meterOptions{samplingRate: 1, fragmentEntries: 1,
+				firewall: &firewall.Policy{Config: firewall.Config{Enabled: true, AuditMode: audit}, Kernel: compiled}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			want := uint32(2)
+			if audit {
+				want = ^uint32(0)
+			}
+			first, later := fragmentPackets(4, 1)
+			binary.BigEndian.PutUint16(first[36:38], 444)
+			verdict(t, m, "meter", first, want)
+			verdict(t, m, "meter", later, want)
+			first, later = fragmentPackets(4, 2)
+			verdict(t, m, "meter", first, ^uint32(0))
+			verdict(t, m, "meter", later, ^uint32(0))
+			first, later = fragmentPackets(4, 3)
+			verdict(t, m, "meter", first, want)
+			verdict(t, m, "meter", later, want)
+			drops, err := m.ReadDrops()
+			if err != nil || len(drops) != 4 || drops[0].Reason != 0 ||
+				drops[1].Reason != 3 || drops[2].Reason != 4 || drops[3].Reason != 3 {
+				t.Fatalf("fragment audit/capacity: %+v %v", drops, err)
+			}
+		})
+	}
+}
+
+func TestKernelFirewallFragmentTransportHeaders(t *testing.T) {
+	rules := []firewall.Rule{
+		{ID: "udp", Direction: "ingress", Action: "allow", Source: "*", Destination: "*", Protocol: "udp", DestinationPort: "443"},
+		{ID: "tcp", Direction: "ingress", Action: "allow", Source: "*", Destination: "*", Protocol: "tcp", DestinationPort: "443"},
+	}
+	m := firewallTestMeter(t, rules, false, 1, 0)
+	first, later := fragmentPackets(4, 1)
+	first = append(first, make([]byte, 16)...)
+	binary.BigEndian.PutUint16(first[16:18], 44)
+	first[23] = 6
+	clear(first[38:])
+	first[46], first[47] = 0x50, 2
+	later[23] = 6
+	binary.BigEndian.PutUint16(later[20:22], 3)
+	verdict(t, m, "meter", first, ^uint32(0))
+	verdict(t, m, "meter", later, ^uint32(0))
+
+	// A fragmented UDP response can use connection state from an allowed request.
+	first, later = fragmentPackets(4, 2)
+	verdict(t, m, "meter", first, ^uint32(0))
+	first, later = fragmentPackets(4, 3)
+	for _, packet := range [][]byte{first, later} {
+		copy(packet[26:30], []byte{10, 0, 0, 2})
+		copy(packet[30:34], []byte{10, 0, 0, 1})
+	}
+	binary.BigEndian.PutUint16(first[34:36], 443)
+	binary.BigEndian.PutUint16(first[36:38], 1234)
+	verdict(t, m, "meter_egress", first, ^uint32(0))
+	verdict(t, m, "meter_egress", later, ^uint32(0))
+
+	first, later = fragmentPackets(6, 4)
+	// Destination Options after the fragment header belong only to the first fragment.
+	first = append(append(append([]byte(nil), first[:62]...), make([]byte, 8)...), first[62:]...)
+	binary.BigEndian.PutUint16(first[18:20], 24)
+	first[54], first[62] = 60, 17
+	later[54] = 60
+	binary.BigEndian.PutUint16(later[56:58], 16)
+	verdict(t, m, "meter", first, ^uint32(0))
+	verdict(t, m, "meter", later, ^uint32(0))
+
+	first, later = fragmentPackets(6, 5)
+	binary.BigEndian.PutUint16(first[56:58], 0)
+	binary.BigEndian.PutUint16(first[66:68], 8)
+	verdict(t, m, "meter", first, ^uint32(0))
+	verdict(t, m, "meter", later, 2)
+	// Malformed first fragments must not authorize subsequent fragments.
+	first, later = fragmentPackets(4, 6)
+	first[14] = 0x40
+	verdict(t, m, "meter", first, 2)
+	verdict(t, m, "meter", later, 2)
+	drops, err := m.ReadDrops()
+	if err != nil || len(drops) != 3 || drops[0].Reason != 3 ||
+		drops[1].Reason != 2 || drops[2].Reason != 3 {
+		t.Fatalf("fragment transport handling: %+v %v", drops, err)
+	}
 }
 
 func TestKernelFirewallConcurrentRuleReplacement(t *testing.T) {
@@ -677,5 +947,16 @@ func testKernelFirewallLiveTCX(t *testing.T, audit bool) {
 	drops, err := m.ReadDrops()
 	if err != nil || len(drops) != 1 || drops[0].Direction != 2 || drops[0].DestinationPort != 444 {
 		t.Fatalf("live egress drop: %+v %v", drops, err)
+	}
+	first, later := fragmentPackets(4, 123)
+	for _, fragment := range [][]byte{first, later} {
+		copy(fragment[:6], peer.HardwareAddr)
+		copy(fragment[6:12], host.HardwareAddr)
+		if err := unix.Sendto(tx, fragment, 0, &unix.SockaddrLinklayer{Ifindex: host.Index, Protocol: htons(0x0800)}); err != nil {
+			t.Fatal(err)
+		}
+		if n, _, err := unix.Recvfrom(rx, buffer, 0); err != nil || n != len(fragment) {
+			t.Fatalf("allowed fragment not delivered: %d %v", n, err)
+		}
 	}
 }

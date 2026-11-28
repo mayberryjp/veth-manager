@@ -971,8 +971,21 @@ The same hook submits eligible IPFIX metadata **before** returning a firewall
 drop, so denied flows remain visible. Existing IPFIX sampling, capture filters,
 fragment exclusions, collector exclusions and bounded-buffer losses still
 apply; use `sampling_rate: 1` and `capture_filter: ""` for fullest visibility.
-Excluded fragments and malformed/unsupported packets are denied and logged,
-but are not guessed into IPFIX flows. Non-IP frames other than ARP are denied.
+Fragments remain excluded from IPFIX flows, but the firewall evaluates the
+first IPv4/IPv6 fragment using its transport header and normal rules or
+connection state. Only an allowed first fragment authorizes later fragments
+with the same source, destination, IP protocol, fragment ID and hook direction
+on that veth. Authorization lasts 30 seconds from the first fragment, is not
+extended by later fragments, and is invalidated by policy-generation changes.
+IPv6 atomic fragments are evaluated normally without creating authorization.
+Orphaned, out-of-order (before the first), expired and unauthorized fragments
+are denied with `unsupported-or-fragment`; a full 65,536-entry per-veth
+fragment table denies new authorizations with `state-table-full`. Expired
+entries are reclaimed by the existing state cleanup. Audit mode and
+unenforced hooks still log would-be denials and do not authorize denied
+datagrams. This is fragment authorization, not packet reassembly or overlap
+detection. Malformed/unsupported packets and non-IP frames other than ARP
+are denied and logged.
 A full IPFIX buffer never bypasses firewall enforcement. This order applies
 within this daemon's hook; it cannot observe packets dropped by an earlier
 external classifier.

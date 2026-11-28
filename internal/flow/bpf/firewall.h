@@ -47,6 +47,34 @@ struct {
     __type(value, struct state_value);
 } connections SEC(".maps");
 
+struct fragment_key {
+    __u8 source[16], destination[16];
+    __u32 id;
+    __u8 protocol, family, direction, padding;
+};
+
+struct fragment_value {
+    struct bpf_spin_lock lock;
+    __u32 generation;
+    __u64 first;
+    __u16 source_port, destination_port;
+    __u8 protocol, retiring, padding[2];
+};
+
+struct packet_fragment {
+    struct fragment_key key;
+    int later;
+};
+
+#define FRAGMENT_TIMEOUT 30000000000ULL
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct fragment_key);
+    __type(value, struct fragment_value);
+} fragments SEC(".maps");
+
 struct drop_event {
     struct flow_key key;
     __u64 time;
@@ -247,12 +275,44 @@ static long find_rule(__u32 index, void *data) {
     return 0;
 }
 
+static __always_inline int authorize_fragment(struct flow_key *key, struct fragment_key *fragment,
+                                              __u64 now, __u32 generation) {
+    if (!fragment)
+        return 0;
+    struct fragment_value value = {
+        .generation = generation, .first = now,
+        .source_port = key->source_port, .destination_port = key->destination_port,
+        .protocol = key->protocol,
+    };
+    long result = bpf_map_update_elem(&fragments, fragment, &value, BPF_NOEXIST);
+    if (result == -17) {
+        struct fragment_value *existing = bpf_map_lookup_elem(&fragments, fragment);
+        if (existing) {
+            bpf_spin_lock(&existing->lock);
+            if (!existing->retiring && existing->generation <= generation) {
+                existing->generation = generation;
+                existing->first = now;
+                existing->source_port = key->source_port;
+                existing->destination_port = key->destination_port;
+                existing->protocol = key->protocol;
+                result = 0;
+            }
+            bpf_spin_unlock(&existing->lock);
+        }
+    }
+    return result != 0;
+}
+
 static __noinline int firewall(struct flow_key *key, __u8 direction,
-                                    __u8 flags, __u32 octets) {
+                                    __u8 flags, __u32 octets,
+                                    struct packet_fragment *packet_fragment) {
     if (!firewall_enabled)
         return -1;
-    if (permit_all_icmp && ((key->family == 4 && key->protocol == 1) ||
-                           (key->family == 6 && key->protocol == 58)))
+    struct fragment_key *fragment = packet_fragment ? &packet_fragment->key : 0;
+    int later = packet_fragment ? packet_fragment->later : 0;
+    int icmp = permit_all_icmp && ((key->family == 4 && key->protocol == 1) ||
+                                 (key->family == 6 && key->protocol == 58));
+    if (icmp && !fragment)
         return -1;
     __u64 now = bpf_ktime_get_ns();
     struct rule_context context = {.key = *key, .direction = direction};
@@ -266,8 +326,33 @@ static __noinline int firewall(struct flow_key *key, __u8 direction,
     if (!version)
         return deny(key, direction, 0, 5, octets, 0);
     __u32 generation = version->id;
-    if (established(key, direction, flags, now, generation))
+    if (fragment) {
+        struct fragment_value *state = bpf_map_lookup_elem(&fragments, fragment);
+        int allow = 0;
+        if (state) {
+            bpf_spin_lock(&state->lock);
+            if (later) {
+                if (!state->retiring && state->generation == generation &&
+                    state->first && now - state->first <= FRAGMENT_TIMEOUT) {
+                    key->source_port = state->source_port;
+                    key->destination_port = state->destination_port;
+                    key->protocol = state->protocol;
+                    allow = 1;
+                }
+            } else if (state->generation <= generation) {
+                // A new first fragment must not inherit an earlier datagram's allowance.
+                state->first = 0;
+            }
+            bpf_spin_unlock(&state->lock);
+        }
+        if (later)
+            return allow ? -1 : deny(key, direction, 0, 3, octets, generation);
+    }
+    if (icmp || established(key, direction, flags, now, generation)) {
+        if (authorize_fragment(key, fragment, now, generation))
+            return deny(key, direction, 0, 4, octets, generation);
         return -1;
+    }
     bpf_loop(256, find_rule, &context, 0);
     if (context.matched) {
         if (!context.action) {
@@ -276,6 +361,8 @@ static __noinline int firewall(struct flow_key *key, __u8 direction,
             return deny(key, direction, context.matched, 1, octets, generation);
         }
         if (remember(key, direction, flags, now, generation))
+            return deny(key, direction, context.matched, 4, octets, generation);
+        if (authorize_fragment(key, fragment, now, generation))
             return deny(key, direction, context.matched, 4, octets, generation);
         return -1;
     }
@@ -305,6 +392,22 @@ static long expire_connection(void *map, const void *key, void *value, void *con
     return 0;
 }
 
+static long expire_fragment(void *map, const void *key, void *value, void *context) {
+    struct fragment_value *state = value;
+    struct expiry_context *expiry = context;
+    int expired = 0;
+    bpf_spin_lock(&state->lock);
+    if (state->generation != expiry->generation || !state->first ||
+        expiry->now - state->first > FRAGMENT_TIMEOUT) {
+        state->retiring = 1;
+        expired = 1;
+    }
+    bpf_spin_unlock(&state->lock);
+    if (expired)
+        bpf_map_delete_elem(map, key);
+    return 0;
+}
+
 SEC("classifier")
 int expire_states(struct __sk_buff *skb) {
     __u32 slot = 0, metadata = 256;
@@ -316,5 +419,6 @@ int expire_states(struct __sk_buff *skb) {
         return 0;
     struct expiry_context expiry = {.now = bpf_ktime_get_ns(), .generation = version->id};
     bpf_for_each_map_elem(&connections, expire_connection, &expiry, 0);
+    bpf_for_each_map_elem(&fragments, expire_fragment, &expiry, 0);
     return 0;
 }

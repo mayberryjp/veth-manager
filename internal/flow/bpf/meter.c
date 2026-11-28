@@ -58,9 +58,26 @@ static __always_inline __u16 be16(const __u8 *p) {
     return ((__u16)p[0] << 8) | p[1];
 }
 
+static __noinline int collector_matches(struct flow_key *key) {
+    if (key->protocol != 17 || key->family != collector.family ||
+        key->destination_port != collector.destination_port)
+        return 0;
+    __u8 target[16];
+#pragma unroll
+    for (int i = 0; i < 16; i++)
+        target[i] = collector.destination[i];
+    __u64 destination[2], expected[2];
+    __builtin_memcpy(destination, key->destination, 16);
+    __builtin_memcpy(expected, target, 16);
+    return destination[0] == expected[0] && destination[1] == expected[1];
+}
+
 static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
     int sampled = 1;
     struct flow_key key = {};
+    struct packet_fragment fragment = {};
+    int fragmented = 0, later = 0;
+    __u8 tcp_flags = 0;
     __u64 octets = 0;
     if (sampling_rate > 1) {
         __u32 index = 0;
@@ -115,9 +132,21 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
         key.tos = ip[1];
         __builtin_memcpy(key.source, ip + 12, 4);
         __builtin_memcpy(key.destination, ip + 16, 4);
-        if (be16(ip + 6) & 0x3fff)
-            goto excluded;
         transport = offset + ihl;
+        __u16 bits = be16(ip + 6);
+        if (bits & 0x3fff) {
+            if (!firewall_enabled)
+                goto excluded;
+            __u32 payload = octets - ihl;
+            if ((bits & 0xc000) || !payload || ((bits & 0x2000) && (payload & 7)))
+                goto malformed;
+            fragmented = 1;
+            fragment.key.id = be16(ip + 4);
+            fragment.key.protocol = key.protocol;
+            later = bits & 0x1fff;
+            if (later)
+                goto fragment_enforce;
+        }
     } else {
         __u8 ip[40];
         if (bpf_skb_load_bytes(skb, offset, ip, 40))
@@ -146,7 +175,24 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
                 if (key.protocol == 51)
                     length = (extension[1] + 2) * 4;
                 if (key.protocol == 44) {
-                    goto excluded;
+                    if (!firewall_enabled)
+                        goto excluded;
+                    __u16 bits = be16(extension + 2);
+                    __u32 payload = offset + octets - transport - 8;
+                    if (fragmented || extension[1] || (bits & 6) ||
+                        !payload || ((bits & 1) && (payload & 7)))
+                        goto malformed;
+                    fragmented = 1;
+                    fragment.key.id = ((__u32)be16(extension + 4) << 16) | be16(extension + 6);
+                    fragment.key.protocol = extension[0];
+                    key.protocol = extension[0];
+                    later = bits & 0xfff8;
+                    if (later)
+                        goto fragment_enforce;
+                    // Atomic fragments need policy evaluation but no cached authorization.
+                    if (!(bits & 1))
+                        fragmented = 2;
+                    length = 8;
                 }
                 key.protocol = extension[0];
                 transport += length;
@@ -156,7 +202,6 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
             key.protocol == 51 || key.protocol == 44 || transport > offset + octets)
             goto malformed;
     }
-    __u8 tcp_flags = 0;
     if (key.protocol == 6 || key.protocol == 17 || key.protocol == 132) {
         __u8 ports[4];
         __u32 minimum = key.protocol == 6 ? 20 : key.protocol == 17 ? 8 : 12;
@@ -183,6 +228,8 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
             goto malformed;
         key.destination_port = be16(icmp);
     }
+    if (fragmented)
+        goto fragment_enforce;
     if (!sampled)
         goto enforce;
     if ((capture_filter == 1 && key.family != 4) ||
@@ -194,18 +241,9 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
         loss(3);
         goto enforce;
     }
-    if (key.protocol == 17 && key.family == collector.family &&
-        key.destination_port == collector.destination_port) {
-        int matches = 1;
-#pragma unroll
-        for (int i = 0; i < 16; i++) {
-            if (key.destination[i] != collector.destination[i])
-                matches = 0;
-        }
-        if (matches) {
-            loss(4);
-            goto enforce;
-        }
+    if (collector_matches(&key)) {
+        loss(4);
+        goto enforce;
     }
     struct packet_event *event = bpf_ringbuf_reserve(&packets, sizeof(*event), 0);
     if (!event) {
@@ -219,7 +257,17 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
     event->time = bpf_ktime_get_ns();
     bpf_ringbuf_submit(event, 0);
 enforce:
-    return firewall(&key, direction, tcp_flags, octets);
+    return firewall(&key, direction, tcp_flags, octets, 0);
+fragment_enforce:
+    if (sampled)
+        loss(2);
+    __builtin_memcpy(fragment.key.source, key.source, 16);
+    __builtin_memcpy(fragment.key.destination, key.destination, 16);
+    fragment.key.family = key.family;
+    fragment.key.direction = direction;
+    fragment.later = later;
+    return firewall(&key, direction, later ? 0 : tcp_flags, octets,
+                    fragmented == 1 ? &fragment : 0);
 malformed:
     if (sampled)
         loss(1);
